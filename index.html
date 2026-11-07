@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VR Odds Ticker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&display=swap">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #03060d; overflow: hidden; color: #e8efff;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #stage canvas:active { cursor: grabbing; }
+  .tag { position: fixed; left: 14px; top: 12px; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: #7f93ba; pointer-events: none; }
+  .tag b { color: #ff7a8a; font-weight: 600; }
+  #msg { position: fixed; left: 0; right: 0; top: 40%; text-align: center; color: #ff9aa6; padding: 0 24px; }
+  #bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; gap: 8px; padding: 8px;
+    border-radius: 16px; background: rgba(10,16,30,.84); border: 1px solid rgba(120,150,210,.25); backdrop-filter: blur(8px); }
+  button { font: inherit; font-size: 14px; color: #e8efff; background: #17233f; border: 1px solid #2b3f68;
+    border-radius: 10px; padding: 10px 14px; cursor: pointer; white-space: nowrap; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #2a5bd7; border-color: #4b7cf0; }
+  #panel { position: fixed; left: 50%; bottom: 76px; transform: translateX(-50%); width: min(94vw, 400px); max-height: 68vh;
+    overflow-y: auto; padding: 14px 16px 10px; border-radius: 16px; background: rgba(10,16,30,.94);
+    border: 1px solid rgba(120,150,210,.25); backdrop-filter: blur(10px); font-size: 13px; }
+  #panel[hidden] { display: none; }
+  .sec { margin: 0 0 12px; }
+  .lab { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: #7f93ba; margin: 0 0 6px; }
+  .grp { display: flex; flex-wrap: wrap; gap: 6px; }
+  .opt { padding: 8px 12px; font-size: 13px; border-radius: 9px; background: #121d36; }
+  .opt.on { background: #2a5bd7; border-color: #4b7cf0; color: #fff; }
+  .opt.act { background: transparent; border-style: dashed; color: #a9b9db; }
+  .stepline { display: grid; grid-template-columns: 74px 1fr 66px; gap: 8px; align-items: center; margin: 4px 0; color: #a9b9db; }
+  .stepline output { text-align: right; color: #e8efff; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: #4b7cf0; }
+  .tog { display: flex; align-items: center; gap: 8px; margin: 6px 0; color: #a9b9db; }
+  .note { margin: 12px 0 2px; color: #7f93ba; font-size: 12px; line-height: 1.5; }
+  #hint { position: fixed; left: 50%; top: 14%; transform: translateX(-50%); padding: 8px 14px; border-radius: 999px;
+    background: rgba(10,16,30,.78); color: #b9c7e6; font-size: 13px; pointer-events: none; transition: opacity .8s; text-align: center; max-width: 92vw; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div class="tag">Odds ticker &middot; <b>simulated data</b></div>
+<div id="msg"></div>
+<div id="hint">Drag to look around &middot; scroll to zoom &middot; Settings for leagues, scores/odds and layout</div>
+<div id="panel" hidden></div>
+<div id="bar">
+  <button id="btnVR" disabled>Checking VR&hellip;</button>
+  <button id="btnAR" disabled hidden>Passthrough</button>
+  <button id="btnPause">Pause</button>
+  <button id="btnGear">Settings</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+'use strict';
+var $ = function (id) { return document.getElementById(id); };
+if (!window.THREE) { $('msg').textContent = 'Could not load Three.js from the CDN. Check your connection and reload.'; return; }
+var MU = THREE.MathUtils;
+
+/* ======================================================================
+   SETTINGS (all of these are editable from the Settings panel and are
+   remembered between visits where the browser allows it)
+   ====================================================================== */
+var CFG = {
+  radius: 4,          // metres from the viewer to the ticker surface
+  cardPx: [512, 320], // card canvas size
+  content: 'both',    // 'both' | 'scores' | 'odds'
+  fmt: 'us',          // odds format: 'us' | 'dec' | 'pct'
+  tilt: 25,           // 0 = ribbon above the horizon, 90 = arch straight over your head
+  size: 1,            // card size multiplier
+  arc: 180,           // visible arc in degrees
+  speed: 4,           // degrees per second
+  reverse: false,     // scroll direction
+  brightness: 1,
+  opacity: 1,
+  env: true,          // floor grid + stars in VR (never shown in passthrough)
+  leagues: {},        // league -> false when hidden
+  rows: { live: true, lines: true, moves: true },
+  eye: 1.6            // desktop eye height, metres
+};
+var BASE = { cardW: 20, pitch: 21, rowH: 12.5, gap: 1 };      // degrees at size 1
+var NCARDS = 16;                                               // card meshes per row
+var FLASH_MS = 6000, SCORE_MS = 4500;
+var PRESETS = [0, 25, 55, 90];
+var LEAGUE_ORDER = ['NFL', 'NBA', 'NHL', 'NCAAF', 'EPL'];
+var uiStale = false;
+function geo() {
+  var s = CFG.size;
+  return { cardW: BASE.cardW * s, pitch: BASE.pitch * s, rowH: BASE.rowH * s, gap: BASE.gap * s, fadeEnd: CFG.arc / 2 + 8, fadeStart: CFG.arc / 2 - 12 };
+}
+function leagueOn(l) { return CFG.leagues[l] !== false; }
+function showScores() { return CFG.content !== 'odds'; }
+function showOdds() { return CFG.content !== 'scores'; }
+
+/* ======================================================================
+   SMALL HELPERS
+   ====================================================================== */
+var rand = function (a, b) { return a + Math.random() * (b - a); };
+var pick = function (a) { return a[Math.floor(Math.random() * a.length)]; };
+var clamp = function (x, a, b) { return Math.min(b, Math.max(a, x)); };
+var roundHalf = function (x) { return Math.round(x * 2) / 2; };
+var logistic = function (z) { return 1 / (1 + Math.exp(-z)); };
+function randn() { var u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+function pickTwo(arr) { var a = arr.slice(); for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return [a[0], a[1]]; }
+function toAmerican(q) {
+  q = clamp(q, 0.03, 0.97);
+  var o = q >= 0.5 ? -100 * q / (1 - q) : 100 * (1 - q) / q;
+  o = Math.round(o / 5) * 5;
+  if (Math.abs(o) < 100) o = o < 0 ? -100 : 100;
+  return o;
+}
+function qOf(o) { if (o == null) return null; return o < 0 ? -o / (-o + 100) : 100 / (o + 100); }       // American odds -> implied prob
+function pHomeOf(ml) { var a = qOf(ml.home), b = qOf(ml.away); return (a == null || b == null) ? null : a / (a + b); }
+function fmtO(n) {                                                                                      // price in the chosen format
+  if (n == null) return '—';
+  if (CFG.fmt === 'dec') return (n > 0 ? 1 + n / 100 : 1 + 100 / -n).toFixed(2);
+  if (CFG.fmt === 'pct') return Math.round(qOf(n) * 100) + '%';
+  return n > 0 ? '+' + n : '−' + Math.abs(n);
+}
+function fmtLine(x) { return x == null ? '—' : x === 0 ? 'PK' : (x > 0 ? '+' : '−') + Math.abs(x); }
+function fmtStart(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' }).replace(',', '').toUpperCase();
+}
+
+/* ======================================================================
+   DATA MODEL  (what the ticker consumes - any feed just has to produce this)
+
+   {
+     id, league, state: 'pre' | 'live' | 'final',
+     home: {name, abbr}, away: {name, abbr},
+     clock: 'Q3 8:42' | "67'" | '',   startTime: ms epoch,
+     score: {home, away} | null,
+     ml:     {home, away},                       // American odds
+     spread: {line, home, away},                 // line is from the HOME side, prices American
+     total:  {line, over, under},
+     lastScore: {side:'home'|'away', at: ms}     // optional, highlights the score briefly
+     open:   {pHome, ml:{home,away}}             // optional, otherwise first-seen values are used
+     simulated: true                             // optional, prints a SIMULATED DATA tag on the cards
+   }
+   Unknown league names are fine: they get their own toggle in Settings.
+   ====================================================================== */
+var LEAGUES = {
+  NFL:   { color: '#4aa3ff', total: 3600, periods: 4, tick: 8,  events: 8.7, steps: [3, 7, 7, 6, 3],       scale: 6,   totalBase: 46,  sens: 0.12,  clock: 'Q' },
+  NBA:   { color: '#ff8a4c', total: 2880, periods: 4, tick: 7,  events: 104, steps: [2, 2, 2, 3, 1, 3],    scale: 6,   totalBase: 226, sens: 0.075, clock: 'Q' },
+  NHL:   { color: '#6fe0ff', total: 3600, periods: 3, tick: 8,  events: 6,   steps: [1],                   scale: 0.6, totalBase: 6,   sens: 0.55,  clock: 'P' },
+  NCAAF: { color: '#ffc247', total: 3600, periods: 4, tick: 8,  events: 9,   steps: [7, 7, 3, 6, 7],       scale: 9,   totalBase: 55,  sens: 0.09,  clock: 'Q' },
+  EPL:   { color: '#b88bff', total: 5400, periods: 2, tick: 12, events: 2.7, steps: [1],                   scale: 0.6, totalBase: 2.7, sens: 0.9,   clock: 'min' }
+};
+function T(abbr, name) { return { abbr: abbr, name: name }; }
+var TEAMS = {
+  NFL: [T('KC','Chiefs'),T('BUF','Bills'),T('PHI','Eagles'),T('DET','Lions'),T('BAL','Ravens'),T('SF','49ers'),T('DAL','Cowboys'),T('GB','Packers'),T('MIN','Vikings'),T('HOU','Texans'),T('LAC','Chargers'),T('SEA','Seahawks')],
+  NBA: [T('BOS','Celtics'),T('OKC','Thunder'),T('DEN','Nuggets'),T('NYK','Knicks'),T('LAL','Lakers'),T('MIL','Bucks'),T('PHX','Suns'),T('GSW','Warriors'),T('MIA','Heat'),T('CLE','Cavaliers'),T('MIN','Wolves'),T('DAL','Mavericks')],
+  NHL: [T('EDM','Oilers'),T('FLA','Panthers'),T('COL','Avalanche'),T('NYR','Rangers'),T('VGK','Golden Knights'),T('TOR','Maple Leafs'),T('DAL','Stars'),T('CAR','Hurricanes'),T('BOS','Bruins'),T('WPG','Jets')],
+  NCAAF: [T('UGA','Georgia'),T('OSU','Ohio State'),T('TEX','Texas'),T('ORE','Oregon'),T('ALA','Alabama'),T('MICH','Michigan'),T('ND','Notre Dame'),T('PSU','Penn State'),T('CLEM','Clemson'),T('LSU','LSU')],
+  EPL: [T('ARS','Arsenal'),T('MCI','Man City'),T('LIV','Liverpool'),T('CHE','Chelsea'),T('TOT','Spurs'),T('NEW','Newcastle'),T('AVL','Aston Villa'),T('BHA','Brighton'),T('MUN','Man United'),T('WHU','West Ham')]
+};
+
+/* ======================================================================
+   FEED 1: SIMULATOR (default).  Random-walk odds so the ticker looks alive.
+   ====================================================================== */
+function clockText(L, elapsed) {
+  if (elapsed >= L.total) return 'FINAL';
+  if (L.clock === 'min') return Math.min(90, Math.floor(elapsed / 60) + 1) + "'";
+  var plen = L.total / L.periods;
+  var p = Math.min(L.periods, Math.floor(elapsed / plen) + 1);
+  var left = Math.max(0, plen - (elapsed - (p - 1) * plen));
+  var ss = Math.floor(left % 60);
+  return L.clock + p + ' ' + Math.floor(left / 60) + ':' + (ss < 10 ? '0' : '') + ss;
+}
+
+function SimGame(league, live, id, fresh) {
+  var L = LEAGUES[league];
+  this.L = L; this.league = league; this.id = id; this.live = live;
+  var two = pickTwo(TEAMS[league]);
+  this.away = two[0]; this.home = two[1];
+  this.m0 = clamp(randn() * L.scale * 0.75 + 0.1 * L.scale, -1.6 * L.scale, 1.6 * L.scale);   // home edge in points/goals
+  this.m = live ? this.m0 : this.m0 + randn() * L.scale * 0.18;            // pre-game lines have already drifted a bit
+  this.total0 = roundHalf(L.totalBase * rand(0.93, 1.07));
+  this.tAdj = 0; this.sj = 0; this.tj = 0;
+  this.elapsed = 0; this.hs = 0; this.as = 0; this.noise = 0; this.finalTicks = 0; this.lastScore = null;
+  this.startTime = Math.round((Date.now() + rand(0.5, 10) * 3600e3) / 300e3) * 300e3;
+  this.openP = logistic(this.m0 / L.scale * 0.9);
+  this.openML = { home: toAmerican(this.openP * 1.045), away: toAmerican((1 - this.openP) * 1.045) };
+  if (live) {
+    var target = fresh ? rand(0, 0.03) * L.total : rand(0.05, 0.85) * L.total;
+    while (this.elapsed < target) this.step(L.tick * 1.5);
+    this.lastScore = null;
+  }
+}
+SimGame.prototype.step = function (dt) {
+  var L = this.L;
+  if (this.live) {
+    this.elapsed = Math.min(L.total, this.elapsed + dt);
+    if (this.elapsed < L.total && Math.random() < (L.events / L.total) * dt) {
+      var homeShare = clamp(0.5 + this.m0 / (2 * L.totalBase), 0.35, 0.65);
+      var side = Math.random() < homeShare ? 'home' : 'away';
+      var pts = pick(L.steps);
+      if (side === 'home') this.hs += pts; else this.as += pts;
+      this.lastScore = { side: side, at: Date.now() };
+    }
+    this.noise = clamp(this.noise * 0.93 + randn() * 0.03, -0.45, 0.45);
+  } else {
+    if (Math.random() < 0.22) this.m = clamp(this.m + randn() * L.scale * 0.04, this.m0 - L.scale * 0.6, this.m0 + L.scale * 0.6);
+    if (Math.random() < 0.05) this.tAdj += pick([-0.5, 0.5]);
+  }
+  if (Math.random() < 0.12) this.sj = clamp(this.sj + pick([-1, 1]), -2, 2);
+  if (Math.random() < 0.12) this.tj = clamp(this.tj + pick([-1, 1]), -2, 2);
+};
+SimGame.prototype.isFinal = function () { return this.live && this.elapsed >= this.L.total; };
+SimGame.prototype.snapshot = function () {
+  var L = this.L, rem = this.live ? 1 - this.elapsed / L.total : 1, lead = this.hs - this.as;
+  var z = (this.m / L.scale * 0.9) * rem + lead * L.sens / (0.2 + rem) + (this.live ? this.noise : 0);
+  var p = logistic(z);
+  if (this.live && rem <= 0.002) p = lead > 0 ? 0.97 : lead < 0 ? 0.03 : 0.5;
+  var pts = this.hs + this.as;
+  return {
+    id: this.id, league: this.league, simulated: true,
+    state: !this.live ? 'pre' : (rem <= 0.002 ? 'final' : 'live'),
+    home: this.home, away: this.away,
+    clock: this.live ? clockText(L, this.elapsed) : '',
+    startTime: this.startTime,
+    score: this.live ? { home: this.hs, away: this.as } : null,
+    lastScore: this.lastScore,
+    ml: { home: toAmerican(p * 1.045), away: toAmerican((1 - p) * 1.045) },
+    spread: { line: -roundHalf(lead + this.m * rem) || 0, home: -110 + 5 * this.sj, away: -110 - 5 * this.sj },
+    total: { line: roundHalf(pts + (this.total0 + this.tAdj) * rem), over: -110 + 5 * this.tj, under: -110 - 5 * this.tj },
+    open: { pHome: this.openP, ml: this.openML }
+  };
+};
+
+function createSimFeed() {
+  var seq = 0, games = [];
+  var plan = [['NFL',1],['NFL',1],['NBA',1],['NBA',1],['NBA',1],['NHL',1],['NHL',1],['NCAAF',1],['EPL',1],
+              ['NFL',0],['NFL',0],['NBA',0],['NBA',0],['NHL',0],['NCAAF',0],['NCAAF',0],['EPL',0],['EPL',0],['NHL',0]];
+  plan.forEach(function (p) { games.push(new SimGame(p[0], !!p[1], ++seq, false)); });
+  function snap() { return games.map(function (g) { return g.snapshot(); }); }
+  return {
+    isSimulated: true,
+    start: function (emit) {
+      emit(snap());
+      setInterval(function () {
+        games.forEach(function (g, i) {
+          g.step(g.L.tick * 1.5);
+          if (g.isFinal() && ++g.finalTicks > 4) games[i] = new SimGame(g.league, true, ++seq, true);
+        });
+        emit(snap());
+      }, 1500);
+    }
+  };
+}
+
+/* ======================================================================
+   FEED 2: The Odds API (https://the-odds-api.com)  -  UNTESTED EXAMPLE
+   Needs an API key and a page that is allowed to call the API (a page hosted
+   on your own domain, not the sandboxed preview). Register it with:
+     OddsTicker.useFeed(OddsTicker.createOddsApiFeed({ apiKey: 'YOUR_KEY' }))
+   ====================================================================== */
+function createOddsApiFeed(opts) {
+  var sports = opts.sports || { americanfootball_nfl: 'NFL', americanfootball_ncaaf: 'NCAAF', basketball_nba: 'NBA', icehockey_nhl: 'NHL', soccer_epl: 'EPL' };
+  var every = opts.pollMs || 60000;
+  function team(n) { return { name: n, abbr: n.replace(/[^A-Za-z ]/g, '').split(' ').pop().slice(0, 3).toUpperCase() }; }
+  function find(book, key) { for (var i = 0; i < book.markets.length; i++) if (book.markets[i].key === key) return book.markets[i]; return null; }
+  function out(m, name) { if (!m) return null; for (var i = 0; i < m.outcomes.length; i++) if (m.outcomes[i].name === name) return m.outcomes[i]; return null; }
+  async function poll(emit) {
+    var all = [];
+    for (var key in sports) {
+      try {
+        var res = await fetch('https://api.the-odds-api.com/v4/sports/' + key + '/odds/?regions=' + (opts.regions || 'us') +
+          '&markets=h2h,spreads,totals&oddsFormat=american&apiKey=' + encodeURIComponent(opts.apiKey));
+        if (!res.ok) continue;
+        (await res.json()).forEach(function (g) {
+          var bk = g.bookmakers && g.bookmakers[0]; if (!bk) return;
+          var h2h = find(bk, 'h2h'), sp = find(bk, 'spreads'), tot = find(bk, 'totals');
+          var mh = out(h2h, g.home_team), ma = out(h2h, g.away_team), sh = out(sp, g.home_team), sa = out(sp, g.away_team);
+          var ov = out(tot, 'Over'), un = out(tot, 'Under');
+          var started = new Date(g.commence_time).getTime() < Date.now();
+          all.push({
+            id: g.id, league: sports[key], state: started ? 'live' : 'pre', startTime: new Date(g.commence_time).getTime(),
+            home: team(g.home_team), away: team(g.away_team), clock: '', score: null,
+            ml: { home: mh && mh.price, away: ma && ma.price },
+            spread: { line: sh ? sh.point : null, home: sh && sh.price, away: sa && sa.price },
+            total: { line: ov ? ov.point : null, over: ov && ov.price, under: un && un.price }
+          });
+        });
+      } catch (e) { console.warn('odds poll failed for', key, e); }
+    }
+    if (all.length) emit(all);
+  }
+  return { isSimulated: false, start: function (emit) { poll(emit); setInterval(function () { poll(emit); }, every); } };
+}
+
+/* ======================================================================
+   TICKER STORE  (merges feed updates, tracks price flashes, history, movers)
+   ====================================================================== */
+var store = new Map();
+var rows = [
+  { key: 'live',  title: 'Live',  list: [], meshes: [], group: null, geom: null },
+  { key: 'lines', title: 'Lines', list: [], meshes: [], group: null, geom: null },
+  { key: 'moves', title: 'Moves', list: [], meshes: [], group: null, geom: null }
+];
+function sigOf(e) {
+  var s = e.score || {}, m = e.ml || {}, sp = e.spread || {}, t = e.total || {};
+  return [e.state, e.clock, s.home, s.away, m.home, m.away, sp.line, sp.home, sp.away, t.line, t.over, t.under].join('|');
+}
+function ingest(list) {
+  var now = Date.now(), seen = new Set();
+  list.forEach(function (e) {
+    if (!e || e.id == null) return;
+    seen.add(e.id);
+    if (LEAGUE_ORDER.indexOf(e.league) < 0) { LEAGUE_ORDER.push(e.league); uiStale = true; }
+    e.ml = e.ml || {}; e.spread = e.spread || {}; e.total = e.total || {};
+    var t = store.get(e.id), pNow = pHomeOf(e.ml);
+    if (!t) {
+      t = Object.assign({}, e, { version: 1, flash: { home: 0, away: 0, at: 0 }, hist: [], sig: sigOf(e), _hot: 0 });
+      t.open = e.open || { pHome: pNow, ml: { home: e.ml.home, away: e.ml.away } };
+      t.fb = { home: qOf(e.ml.home), away: qOf(e.ml.away) };            // price level at the last flash
+      store.set(e.id, t);
+    } else {
+      // flash a side when its implied probability has moved by at least 1 point since the last flash
+      var changed = false, qh1 = qOf(e.ml.home), qa1 = qOf(e.ml.away);
+      if (qh1 != null && t.fb.home != null && Math.abs(qh1 - t.fb.home) >= 0.01) { t.flash.home = qh1 > t.fb.home ? 1 : -1; t.fb.home = qh1; changed = true; }
+      if (qa1 != null && t.fb.away != null && Math.abs(qa1 - t.fb.away) >= 0.01) { t.flash.away = qa1 > t.fb.away ? 1 : -1; t.fb.away = qa1; changed = true; }
+      if (t.fb.home == null) t.fb.home = qh1;
+      if (t.fb.away == null) t.fb.away = qa1;
+      if (changed) t.flash.at = now;
+      var keep = { open: t.open, flash: t.flash, hist: t.hist, version: t.version, sig: t.sig, _hot: t._hot, fb: t.fb };
+      Object.assign(t, e, keep);
+      var s = sigOf(t); if (s !== t.sig) { t.sig = s; t.version++; }
+    }
+    if (pNow != null) { t.hist.push(pNow); if (t.hist.length > 90) t.hist.shift(); }
+  });
+  store.forEach(function (_, id) { if (!seen.has(id)) store.delete(id); });
+  rebuildLists();
+}
+function moveInfo(t) {
+  var pNow = pHomeOf(t.ml), pOpen = t.open && t.open.pHome;
+  if (pNow == null || pOpen == null) return null;
+  var d = (pNow - pOpen) * 100;
+  return { d: d, side: d >= 0 ? 'home' : 'away', pp: Math.abs(d) };
+}
+function refreshMovers() {
+  var all = Array.from(store.values()).filter(function (t) { return leagueOn(t.league); });
+  var pre = all.filter(function (t) { return t.state === 'pre'; });
+  var pool = pre.length >= 4 ? pre : all;
+  pool.sort(function (a, b) { var x = moveInfo(a), y = moveInfo(b); return (y ? y.pp : 0) - (x ? x.pp : 0); });
+  rows[2].list = pool.slice(0, 10);
+}
+function rebuildLists() {
+  var all = Array.from(store.values()).filter(function (t) { return leagueOn(t.league); });
+  rows[0].list = all.filter(function (t) { return t.state !== 'pre'; });
+  rows[1].list = all.filter(function (t) { return t.state === 'pre'; });
+  if (!rows[2].list.length) refreshMovers();
+}
+setInterval(function () {                                    // expire highlights
+  var now = Date.now();
+  store.forEach(function (t) {
+    if (t.flash.at && now - t.flash.at > FLASH_MS) { t.flash.at = 0; t.version++; }
+    var hot = t.lastScore && now - t.lastScore.at < SCORE_MS;
+    if (hot) t._hot = 1; else if (t._hot) { t._hot = 0; t.version++; }
+  });
+}, 500);
+setInterval(refreshMovers, 6000);
+
+/* ======================================================================
+   CARD DRAWING  (2D canvas -> texture)
+   ====================================================================== */
+var FONT = '"Barlow Condensed","Arial Narrow","Roboto Condensed",system-ui,sans-serif';
+var C = { text: '#eef3ff', dim: '#8fa3c9', faint: '#5d7197', up: '#38e58f', down: '#ff5c70', live: '#ff4a63', gold: '#ffd166', pill: '#16223d', pillLine: '#2c4272' };
+var PAD = 26;
+function font(ctx, w, px) { ctx.font = w + ' ' + px + 'px ' + FONT; }
+function hexA(hex, a) { var n = parseInt(hex.slice(1), 16); return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + a + ')'; }
+function rr(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function fitText(ctx, txt, x, y, maxW, w, px, align) {
+  ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  while (px > 14) { font(ctx, w, px); if (ctx.measureText(txt).width <= maxW) break; px -= 2; }
+  ctx.fillText(txt, x, y);
+}
+function arrow(ctx, x, y, s, dir, color) {
+  ctx.fillStyle = color; ctx.beginPath();
+  if (dir > 0) { ctx.moveTo(x, y - s); ctx.lineTo(x + s, y + s * 0.7); ctx.lineTo(x - s, y + s * 0.7); }
+  else { ctx.moveTo(x, y + s); ctx.lineTo(x + s, y - s * 0.7); ctx.lineTo(x - s, y - s * 0.7); }
+  ctx.closePath(); ctx.fill();
+}
+function flashOf(t, side) { return (t.flash.at && Date.now() - t.flash.at < FLASH_MS) ? t.flash[side] : 0; }
+function labelVal(ctx, x, y, label, val) {
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  font(ctx, 600, 20); ctx.fillStyle = C.faint; ctx.fillText(label, x, y);
+  var w = ctx.measureText(label).width;
+  font(ctx, 700, 30); ctx.fillStyle = C.text; ctx.fillText(String(val), x + w + 8, y + 1);
+}
+function frame(ctx, t) {
+  var W = ctx.canvas.width, H = ctx.canvas.height, L = LEAGUES[t.league] || { color: '#9fb4e0' };
+  ctx.clearRect(0, 0, W, H);
+  rr(ctx, 3, 3, W - 6, H - 6, 26);
+  var g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, 'rgba(20,32,58,.95)'); g.addColorStop(1, 'rgba(8,13,26,.95)');
+  ctx.fillStyle = g; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = 'rgba(125,155,215,.30)'; ctx.stroke();
+  ctx.save(); rr(ctx, 3, 3, W - 6, H - 6, 26); ctx.clip(); ctx.fillStyle = L.color; ctx.fillRect(0, 0, W, 6); ctx.restore();
+  font(ctx, 700, 24); var tw = ctx.measureText(t.league).width;
+  rr(ctx, PAD, 25, tw + 24, 34, 9); ctx.fillStyle = hexA(L.color, 0.22); ctx.fill();
+  ctx.fillStyle = L.color; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(t.league, PAD + 12, 43);
+}
+function simTag(ctx, t, y) {
+  if (!t.simulated) return;
+  font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText('SIMULATED DATA', PAD, y);
+}
+function pricePill(ctx, x, y, w, h, price, fl) {
+  rr(ctx, x, y, w, h, 12);
+  ctx.fillStyle = fl > 0 ? 'rgba(56,229,143,.20)' : fl < 0 ? 'rgba(255,92,112,.20)' : C.pill; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = fl > 0 ? C.up : fl < 0 ? C.down : C.pillLine; ctx.stroke();
+  var x0 = x + (fl ? 42 : 12), avail = x + w - 10 - x0;               // text area; the arrow lives on the left when flashing
+  ctx.fillStyle = fl > 0 ? C.up : fl < 0 ? C.down : C.text;
+  fitText(ctx, fmtO(price), x0 + avail / 2, y + h / 2 + 2, avail, 700, 36, 'center');
+  if (fl) arrow(ctx, x + 24, y + h / 2, 9, fl, fl > 0 ? C.up : C.down);
+}
+
+function drawLive(ctx, t) {
+  var W = ctx.canvas.width, od = showOdds(), sc = showScores() && !!t.score;
+  var sides = [['away', t.away], ['home', t.home]];
+  frame(ctx, t);
+  var clk = t.clock || '', fin = t.state === 'final';
+  font(ctx, 600, 26); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = fin ? C.dim : C.text; ctx.fillText(clk, W - PAD, 43);
+  if (!fin) {
+    var cw = ctx.measureText(clk).width;
+    font(ctx, 700, 20); ctx.fillStyle = C.live; ctx.textAlign = 'right'; ctx.fillText('LIVE', W - PAD - cw - (clk ? 14 : 0), 43);
+    var lw = ctx.measureText('LIVE').width;
+    ctx.beginPath(); ctx.arc(W - PAD - cw - (clk ? 14 : 0) - lw - 14, 43, 6, 0, 6.2832); ctx.fill();
+  }
+  if (!od) {                                                         // scores only: big numbers, no prices
+    var ys2 = [124, 204];
+    sides.forEach(function (s, i) {
+      var side = s[0], y = ys2[i], other = side === 'home' ? 'away' : 'home';
+      var loser = fin && t.score && t.score[side] < t.score[other];
+      var hot = t.score && t.lastScore && t.lastScore.side === side && Date.now() - t.lastScore.at < SCORE_MS;
+      ctx.fillStyle = loser ? C.dim : C.text; fitText(ctx, s[1].name, PAD, y, 300, 700, 52);
+      font(ctx, 700, 78); ctx.textAlign = 'right'; ctx.fillStyle = hot ? C.gold : (loser ? C.dim : C.text);
+      ctx.fillText(t.score ? String(t.score[side]) : '–', W - PAD, y + 3);
+    });
+    simTag(ctx, t, 298);
+    return;
+  }
+  var ys = [112, 182];
+  sides.forEach(function (s, i) {
+    var side = s[0], y = ys[i];
+    ctx.fillStyle = C.text; fitText(ctx, s[1].name, PAD, y, sc ? 160 : 250, 700, 44);
+    if (sc) {
+      var hot = t.lastScore && t.lastScore.side === side && Date.now() - t.lastScore.at < SCORE_MS;
+      font(ctx, 700, 50); ctx.textAlign = 'right'; ctx.fillStyle = hot ? C.gold : C.text; ctx.fillText(String(t.score[side]), 290, y + 2);
+    }
+    pricePill(ctx, 304, y - 27, 182, 54, t.ml[side], flashOf(t, side));
+  });
+  ctx.strokeStyle = 'rgba(125,155,215,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PAD, 228); ctx.lineTo(W - PAD, 228); ctx.stroke();
+  labelVal(ctx, PAD, 258, 'SPREAD', t.home.abbr + ' ' + fmtLine(t.spread.line));
+  labelVal(ctx, 290, 258, 'TOTAL', t.total.line == null ? '—' : t.total.line);
+  simTag(ctx, t, 298);
+}
+
+function drawLines(ctx, t) {
+  var W = ctx.canvas.width;
+  frame(ctx, t);
+  font(ctx, 600, 24); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText(fmtStart(t.startTime), W - PAD, 43);
+  font(ctx, 600, 17); ctx.fillStyle = C.faint; ctx.textAlign = 'center';
+  ctx.fillText('SPREAD', 288, 88); ctx.fillText('MONEYLINE', 421, 88);
+  var ys = [136, 202], sides = [['away', t.away], ['home', t.home]];
+  sides.forEach(function (s, i) {
+    var side = s[0], y = ys[i], line = t.spread.line == null ? null : (side === 'home' ? t.spread.line : -t.spread.line || 0);
+    ctx.fillStyle = C.text; fitText(ctx, s[1].name, PAD, y, 196, 700, 42);
+    rr(ctx, 232, y - 28, 112, 56, 12); ctx.fillStyle = C.pill; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.pillLine; ctx.stroke();
+    font(ctx, 700, 28); ctx.textAlign = 'center'; ctx.fillStyle = C.text; ctx.fillText(fmtLine(line), 288, y - 6);
+    font(ctx, 600, 18); ctx.fillStyle = C.dim; ctx.fillText(fmtO(t.spread[side]), 288, y + 16);
+    pricePill(ctx, 356, y - 28, 130, 56, t.ml[side], flashOf(t, side));
+  });
+  labelVal(ctx, PAD, 266, 'TOTAL', t.total.line == null ? '—' : t.total.line);
+  labelVal(ctx, 214, 266, 'O', fmtO(t.total.over));
+  labelVal(ctx, 346, 266, 'U', fmtO(t.total.under));
+  simTag(ctx, t, 302);
+}
+
+function drawSchedule(ctx, t) {                                      // upcoming game without odds (Scores mode)
+  var W = ctx.canvas.width;
+  frame(ctx, t);
+  font(ctx, 600, 22); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText('UPCOMING', W - PAD, 43);
+  [['away', t.away, 122], ['home', t.home, 186]].forEach(function (r) {
+    ctx.fillStyle = C.text; fitText(ctx, r[1].name, PAD, r[2], 380, 700, 54);
+    font(ctx, 600, 18); ctx.fillStyle = C.faint; ctx.textAlign = 'right'; ctx.fillText(r[0].toUpperCase(), W - PAD, r[2] + 2);
+  });
+  ctx.strokeStyle = 'rgba(125,155,215,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PAD, 232); ctx.lineTo(W - PAD, 232); ctx.stroke();
+  font(ctx, 600, 18); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.fillText('STARTS', PAD, 256);
+  font(ctx, 700, 40); ctx.fillStyle = C.text; ctx.fillText(fmtStart(t.startTime) || 'TBD', PAD + 90, 258);
+  simTag(ctx, t, 302);
+}
+
+function spark(ctx, x, y, w, h, vals, openV, color) {
+  if (vals.length < 2) vals = [openV, openV];
+  var lo = Math.min(openV, Math.min.apply(null, vals)), hi = Math.max(openV, Math.max.apply(null, vals));
+  var pad = Math.max(0.02, (hi - lo) * 0.2); lo -= pad; hi += pad;
+  var X = function (i) { return x + w * i / (vals.length - 1); }, Y = function (v) { return y + h - (v - lo) / (hi - lo) * h; };
+  ctx.setLineDash([6, 6]); ctx.strokeStyle = 'rgba(143,163,201,.45)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, Y(openV)); ctx.lineTo(x + w, Y(openV)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.beginPath(); vals.forEach(function (v, i) { if (i) ctx.lineTo(X(i), Y(v)); else ctx.moveTo(X(i), Y(v)); });
+  ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.lineTo(x + w, y + h); ctx.lineTo(x, y + h); ctx.closePath();
+  var g = ctx.createLinearGradient(0, y, 0, y + h); g.addColorStop(0, hexA(color, 0.28)); g.addColorStop(1, hexA(color, 0)); ctx.fillStyle = g; ctx.fill();
+  ctx.beginPath(); ctx.arc(X(vals.length - 1), Y(vals[vals.length - 1]), 6, 0, 6.2832); ctx.fillStyle = color; ctx.fill();
+}
+function drawMove(ctx, t) {
+  var W = ctx.canvas.width, mv = moveInfo(t) || { d: 0, side: 'home', pp: 0 };
+  frame(ctx, t);
+  font(ctx, 600, 22); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText('LINE MOVE', W - PAD, 43);
+  var order = mv.side === 'home' ? ['home', 'away'] : ['away', 'home'], ys = [108, 166];
+  order.forEach(function (side, i) {
+    var y = ys[i], dl = side === 'home' ? mv.d : -mv.d, dir = Math.abs(dl) < 0.05 ? 0 : (dl > 0 ? 1 : -1);
+    var col = dir > 0 ? C.up : dir < 0 ? C.down : C.dim;
+    ctx.fillStyle = C.text; fitText(ctx, t[side].name, PAD, y, 150, 700, 40);
+    font(ctx, 600, 26); ctx.textAlign = 'right'; ctx.fillStyle = C.faint; ctx.fillText(fmtO(t.open.ml && t.open.ml[side]), 262, y + 1);
+    ctx.strokeStyle = C.faint; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(272, y - 7); ctx.lineTo(281, y); ctx.lineTo(272, y + 7); ctx.stroke();
+    font(ctx, 700, 34); ctx.textAlign = 'left'; ctx.fillStyle = C.text; ctx.fillText(fmtO(t.ml[side]), 292, y + 1);
+    font(ctx, 700, 26); ctx.textAlign = 'right'; ctx.fillStyle = col; var txt = dir ? Math.abs(dl).toFixed(1) : '—'; ctx.fillText(txt, W - PAD, y + 1);
+    if (dir) arrow(ctx, W - PAD - ctx.measureText(txt).width - 14, y, 8, dir, col);
+  });
+  var vals = t.hist.map(function (p) { return mv.side === 'home' ? p : 1 - p; });
+  var oP = t.open.pHome == null ? 0.5 : (mv.side === 'home' ? t.open.pHome : 1 - t.open.pHome);
+  font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.fillText('WIN PROBABILITY TREND', PAD, 208);
+  spark(ctx, PAD, 222, W - PAD * 2, 56, vals, oP, C.up);
+  if (t.simulated) { font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.fillText('SIMULATED DATA', PAD, 302); }
+}
+
+rows[0].draw = drawLive;
+rows[1].draw = function (ctx, t) { (showOdds() ? drawLines : drawSchedule)(ctx, t); };
+rows[2].draw = drawMove;
+function rowOn(r) { return CFG.rows[r.key] !== false && !(r.key === 'moves' && !showOdds()); }
+
+/* ======================================================================
+   THREE.JS SCENE
+   ====================================================================== */
+var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x03060d, 1);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.xr.enabled = true;
+renderer.xr.setFramebufferScaleFactor(1.2);
+$('stage').appendChild(renderer.domElement);
+
+var scene = new THREE.Scene();
+var bgColor = new THREE.Color(0x03060d);
+scene.background = bgColor;
+var camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 200);
+camera.rotation.order = 'YXZ';
+camera.position.set(0, CFG.eye, 0);
+scene.add(camera);
+
+// ambience: floor grid, marker ring, stars (so you always know which way is down). Hidden in passthrough.
+var envGroup = new THREE.Group(); scene.add(envGroup);
+var grid = new THREE.GridHelper(40, 40, 0x16325c, 0x0b1a33); grid.material.transparent = true; grid.material.opacity = 0.55; envGroup.add(grid);
+var ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 0.95, 64), new THREE.MeshBasicMaterial({ color: 0x2f64c8, transparent: true, opacity: 0.7, side: THREE.DoubleSide }));
+ring.rotation.x = -Math.PI / 2; ring.position.y = 0.01; envGroup.add(ring);
+(function () {
+  var n = 700, pos = new Float32Array(n * 3);
+  for (var i = 0; i < n; i++) {
+    var u = Math.random() * 2 - 1, a = Math.random() * 6.2832, r = Math.sqrt(1 - u * u), d = rand(40, 90);
+    pos[i * 3] = r * Math.cos(a) * d; pos[i * 3 + 1] = Math.abs(u) * d * 0.9 + 1; pos[i * 3 + 2] = r * Math.sin(a) * d;
+  }
+  var g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  envGroup.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x7f9ccc, size: 0.35, sizeAttenuation: true, transparent: true, opacity: 0.8 })));
+})();
+var xrMode = 'none';                       // 'none' | 'vr' | 'ar'
+function applyEnv() {
+  var ar = xrMode === 'ar';
+  envGroup.visible = CFG.env && !ar;
+  scene.background = ar ? null : bgColor;
+  renderer.setClearColor(0x03060d, ar ? 0 : 1);
+}
+
+// the ticker rig: sits at the viewer's head, tilted about the left-right axis
+var rig = new THREE.Group(); rig.position.set(0, CFG.eye, 0); scene.add(rig);
+var tiltGroup = new THREE.Group(); rig.add(tiltGroup);
+
+function fillPatch(geom, t0, t1, half) {
+  var R = CFG.radius, segS = 14, segT = 2, p = geom.attributes.position.array, k = 0;
+  for (var j = 0; j <= segT; j++) {
+    var t = MU.degToRad(t0 + (t1 - t0) * j / segT);
+    for (var i = 0; i <= segS; i++) {
+      var s = MU.degToRad(-half + 2 * half * i / segS);
+      p[k++] = R * Math.sin(s) * Math.cos(t); p[k++] = R * Math.sin(t); p[k++] = -R * Math.cos(s) * Math.cos(t);
+    }
+  }
+  geom.attributes.position.needsUpdate = true;
+}
+function makePatchGeometry() {
+  var segS = 14, segT = 2, g = new THREE.BufferGeometry(), uv = [], idx = [];
+  for (var j = 0; j <= segT; j++) for (var i = 0; i <= segS; i++) uv.push(i / segS, j / segT);
+  for (var j2 = 0; j2 < segT; j2++) for (var i2 = 0; i2 < segS; i2++) {
+    var a = j2 * (segS + 1) + i2, b = a + 1, c = a + segS + 1, d = c + 1; idx.push(a, c, b, b, c, d);
+  }
+  g.setIndex(idx);
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((segS + 1) * (segT + 1) * 3), 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  return g;
+}
+var aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+rows.forEach(function (row, ri) {
+  row.group = new THREE.Group();
+  row.geom = makePatchGeometry();
+  tiltGroup.add(row.group);
+  for (var i = 0; i < NCARDS; i++) {
+    var cv = document.createElement('canvas'); cv.width = CFG.cardPx[0]; cv.height = CFG.cardPx[1];
+    var tex = new THREE.CanvasTexture(cv); tex.encoding = THREE.sRGBEncoding; tex.anisotropy = aniso;
+    var mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false, toneMapped: false });
+    var mesh = new THREE.Mesh(row.geom, mat);
+    mesh.frustumCulled = false; mesh.renderOrder = 10 + ri; mesh.visible = false;
+    mesh.userData = { cv: cv, ctx: cv.getContext('2d'), tex: tex, item: null, ver: -1, epoch: -1 };
+    row.group.add(mesh); row.meshes.push(mesh);
+  }
+});
+// Position the visible rows around the tilted great circle. Hidden rows are skipped so the rest re-centre.
+function applyGeometry() {
+  var g = geo(), vis = rows.filter(rowOn), n = Math.max(1, vis.length);
+  tiltGroup.rotation.x = MU.degToRad(CFG.tilt);
+  var tc = (1 - CFG.tilt / 90) * (3 + n / 2 * g.rowH + (n - 1) / 2 * g.gap);   // above the horizon at low tilt, centred overhead at 90
+  rows.forEach(function (r) { r.group.visible = rowOn(r); });
+  vis.forEach(function (r, k) {
+    var c = tc + (k - (n - 1) / 2) * (g.rowH + g.gap);
+    fillPatch(r.geom, c - g.rowH / 2, c + g.rowH / 2, g.cardW / 2);
+  });
+}
+
+var epoch = 0, theta = 0, paused = false, budgetBoost = 3;
+function bump() { epoch++; budgetBoost = 3; }
+function layoutRow(row, g) {
+  if (!row.group.visible) return;
+  var M = row.list.length, budget = budgetBoost > 0 ? 99 : 4, loop = NCARDS * g.pitch;
+  for (var i = 0; i < row.meshes.length; i++) {
+    var m = row.meshes[i], u = m.userData;
+    var s = (((i * g.pitch - theta + loop / 2) % loop) + loop) % loop - loop / 2;
+    var n = Math.round((s + theta) / g.pitch);
+    var item = M ? row.list[((n % M) + M) % M] : null;
+    var o = clamp((g.fadeEnd - Math.abs(s)) / (g.fadeEnd - g.fadeStart), 0, 1);
+    m.rotation.y = -MU.degToRad(s);
+    m.visible = !!item && o > 0.01 && (u.ver >= 0 || budget > 0);
+    if (!item || o <= 0.01) continue;
+    if ((item !== u.item || item.version !== u.ver || u.epoch !== epoch) && budget > 0) {
+      row.draw(u.ctx, item); u.tex.needsUpdate = true; u.item = item; u.ver = item.version; u.epoch = epoch; budget--;
+    }
+    m.material.opacity = o * CFG.opacity;
+    m.material.color.setScalar(CFG.brightness);
+  }
+}
+
+// brief floating message (used for headset button feedback)
+var tcv = document.createElement('canvas'); tcv.width = 512; tcv.height = 96;
+var ttex = new THREE.CanvasTexture(tcv); ttex.encoding = THREE.sRGBEncoding;
+var toastSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: ttex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }));
+toastSprite.scale.set(0.8, 0.15, 1); toastSprite.renderOrder = 999; toastSprite.visible = false; scene.add(toastSprite);
+var toastUntil = 0, _p = new THREE.Vector3(), _d = new THREE.Vector3();
+function toast(txt) {
+  var c = tcv.getContext('2d'); c.clearRect(0, 0, 512, 96);
+  rr(c, 4, 4, 504, 88, 28); c.fillStyle = 'rgba(10,16,30,.9)'; c.fill(); c.strokeStyle = 'rgba(125,155,215,.5)'; c.lineWidth = 3; c.stroke();
+  font(c, 700, 44); c.fillStyle = '#eef3ff'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(txt, 256, 50);
+  ttex.needsUpdate = true;
+  camera.updateMatrixWorld(); camera.getWorldPosition(_p); camera.getWorldDirection(_d);
+  toastSprite.position.copy(_p).addScaledVector(_d, 1.6); toastSprite.position.y -= 0.2;
+  toastSprite.visible = true; toastUntil = performance.now() + 1800;
+}
+
+/* ======================================================================
+   SETTINGS SCHEMA  (one list drives both the on-screen panel and the in-headset panel)
+   ====================================================================== */
+function onFilter() { rebuildLists(); refreshMovers(); }
+function step(label, key, min, max, inc, get, set, fmt) { return { type: 'step', label: label, min: min, max: max, inc: inc, get: get, set: set, fmt: fmt }; }
+var UI = [
+  { type: 'seg', label: 'Show', opts: [['both', 'Scores + odds'], ['scores', 'Scores'], ['odds', 'Odds']],
+    get: function () { return CFG.content; }, set: function (v) { CFG.content = v; bump(); applyGeometry(); } },
+  { type: 'chips', label: 'Leagues', items: function () {
+      var its = LEAGUE_ORDER.map(function (k) {
+        return { label: k, on: leagueOn(k), fn: function () { CFG.leagues[k] = !leagueOn(k); onFilter(); } };
+      });
+      its.push({ label: 'All', fn: function () { CFG.leagues = {}; onFilter(); } });
+      its.push({ label: 'None', fn: function () { LEAGUE_ORDER.forEach(function (k) { CFG.leagues[k] = false; }); onFilter(); } });
+      return its;
+    } },
+  { type: 'chips', label: 'Rows', items: function () {
+      return [['live', 'Live'], ['lines', showOdds() ? 'Lines' : 'Schedule'], ['moves', 'Moves']].map(function (r) {
+        return { label: r[1], on: CFG.rows[r[0]] !== false, fn: function () { CFG.rows[r[0]] = CFG.rows[r[0]] === false; applyGeometry(); } };
+      });
+    } },
+  { type: 'seg', label: 'Odds format', opts: [['us', 'American'], ['dec', 'Decimal'], ['pct', 'Implied %']],
+    get: function () { return CFG.fmt; }, set: function (v) { CFG.fmt = v; bump(); } },
+  step('Tilt', 'tilt', 0, 90, 5, function () { return CFG.tilt; }, function (v) { CFG.tilt = v; applyGeometry(); }, function (v) { return Math.round(v) + '°'; }),
+  step('Size', 'size', 65, 140, 5, function () { return Math.round(CFG.size * 100); }, function (v) { CFG.size = v / 100; applyGeometry(); }, function (v) { return Math.round(v) + '%'; }),
+  step('Arc', 'arc', 90, 180, 10, function () { return CFG.arc; }, function (v) { CFG.arc = v; }, function (v) { return Math.round(v) + '°'; }),
+  step('Speed', 'speed', 0, 15, 0.5, function () { return CFG.speed; }, function (v) { CFG.speed = v; }, function (v) { return v.toFixed(1) + '°/s'; }),
+  step('Brightness', 'bright', 25, 100, 5, function () { return Math.round(CFG.brightness * 100); }, function (v) { CFG.brightness = v / 100; }, function (v) { return Math.round(v) + '%'; }),
+  step('Opacity', 'opacity', 30, 100, 5, function () { return Math.round(CFG.opacity * 100); }, function (v) { CFG.opacity = v / 100; }, function (v) { return Math.round(v) + '%'; }),
+  { type: 'toggle', label: 'Reverse direction', get: function () { return CFG.reverse; }, set: function (v) { CFG.reverse = v; } },
+  { type: 'toggle', label: 'Floor grid + stars (VR)', get: function () { return CFG.env; }, set: function (v) { CFG.env = v; applyEnv(); } }
+];
+UI.forEach(function (u) { if (u.type === 'step') u.step = u.inc < 1 ? u.inc : 1; });     // DOM slider granularity
+
+var SAVE_KEYS = ['content', 'fmt', 'tilt', 'size', 'arc', 'speed', 'reverse', 'brightness', 'opacity', 'env', 'leagues', 'rows'];
+function saveSettings() {
+  try { var o = {}; SAVE_KEYS.forEach(function (k) { o[k] = CFG[k]; }); localStorage.setItem('oddsTicker.v2', JSON.stringify(o)); } catch (e) {}
+}
+function loadSettings() {
+  try {
+    var o = JSON.parse(localStorage.getItem('oddsTicker.v2') || 'null'); if (!o) return;
+    SAVE_KEYS.forEach(function (k) { if (o[k] !== undefined && typeof o[k] === typeof CFG[k]) CFG[k] = o[k]; });
+    CFG.tilt = clamp(CFG.tilt, 0, 90); CFG.size = clamp(CFG.size, 0.65, 1.4); CFG.arc = clamp(CFG.arc, 90, 180);
+    CFG.speed = clamp(CFG.speed, 0, 15); CFG.brightness = clamp(CFG.brightness, 0.25, 1); CFG.opacity = clamp(CFG.opacity, 0.3, 1);
+    if (['both', 'scores', 'odds'].indexOf(CFG.content) < 0) CFG.content = 'both';
+    if (['us', 'dec', 'pct'].indexOf(CFG.fmt) < 0) CFG.fmt = 'us';
+  } catch (e) {}
+}
+function act(fn) { fn(); syncUI(); saveSettings(); }
+function setPaused(v) { paused = v; syncUI(); }
+function setTilt(v) { act(function () { CFG.tilt = clamp(v, 0, 90); applyGeometry(); }); }
+
+/* ---------- on-screen panel (desktop / phone) ---------- */
+function el(tag, cls, txt) { var e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; }
+function domBuild() {
+  var p = $('panel'); p.innerHTML = '';
+  UI.forEach(function (u) {
+    var sec = el('div', 'sec');
+    if (u.type === 'seg') {
+      sec.appendChild(el('div', 'lab', u.label)); var g = el('div', 'grp'); u.dom = [];
+      u.opts.forEach(function (o) { var b = el('button', 'opt', o[1]); b.addEventListener('click', function () { act(function () { u.set(o[0]); }); }); g.appendChild(b); u.dom.push([o[0], b]); });
+      sec.appendChild(g);
+    } else if (u.type === 'chips') {
+      sec.appendChild(el('div', 'lab', u.label)); var g2 = el('div', 'grp'); u.dom = [];
+      u.items().forEach(function (it, i) {
+        var b = el('button', 'opt' + (it.on === undefined ? ' act' : ''), it.label);
+        b.addEventListener('click', function () { act(function () { u.items()[i].fn(); }); });
+        g2.appendChild(b); u.dom.push(b);
+      });
+      sec.appendChild(g2);
+    } else if (u.type === 'step') {
+      sec.className = 'stepline'; var r = document.createElement('input'), out = document.createElement('output');
+      r.type = 'range'; r.min = u.min; r.max = u.max; r.step = u.step;
+      r.addEventListener('input', function () { act(function () { u.set(+r.value); }); });
+      sec.appendChild(el('span', '', u.label)); sec.appendChild(r); sec.appendChild(out); u.dom = { r: r, out: out };
+    } else if (u.type === 'toggle') {
+      sec.className = 'tog'; var cb = document.createElement('input'); cb.type = 'checkbox';
+      cb.addEventListener('change', function () { act(function () { u.set(cb.checked); }); });
+      var lab = el('label', '', u.label); lab.insertBefore(cb, lab.firstChild); lab.style.display = 'flex'; lab.style.gap = '8px'; lab.style.alignItems = 'center';
+      sec.appendChild(lab); u.dom = { cb: cb };
+    }
+    p.appendChild(sec);
+  });
+  p.appendChild(el('p', 'note', 'Tilt: 0° = ribbon above the horizon, 90° = arch over your head. Passthrough (if your headset browser supports it) floats the ticker over your real room. In a headset: B/Y opens this menu as a floating panel (point and pull the trigger). ' +
+    'Trigger = pause, grip = cycle tilt, thumbstick up/down = speed, A/X = recenter. Green ▲ = odds shortened, red ▼ = lengthened. Demo only — all odds here are simulated.'));
+  syncUI();
+}
+var vrDirty = true;
+function syncUI() {
+  UI.forEach(function (u) {
+    if (!u.dom) return;
+    if (u.type === 'seg') u.dom.forEach(function (d) { d[1].classList.toggle('on', u.get() === d[0]); });
+    else if (u.type === 'chips') { var its = u.items(); u.dom.forEach(function (b, i) { if (its[i]) { b.textContent = its[i].label; b.classList.toggle('on', !!its[i].on); } }); }
+    else if (u.type === 'step') { u.dom.r.value = u.get(); u.dom.out.textContent = u.fmt(u.get()); }
+    else if (u.type === 'toggle') u.dom.cb.checked = !!u.get();
+  });
+  $('btnPause').textContent = paused ? 'Play' : 'Pause';
+  vrDirty = true;
+}
+
+/* ---------- floating panel for headsets ---------- */
+var vrW = 1100, panelOpen = false, vrHover = null, vrLayoutCache = null;
+var pcv = document.createElement('canvas'); pcv.width = vrW; pcv.height = 1100;
+var pctx = pcv.getContext('2d');
+var ptex = new THREE.CanvasTexture(pcv); ptex.encoding = THREE.sRGBEncoding; ptex.anisotropy = aniso;
+var panel = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), new THREE.MeshBasicMaterial({ map: ptex, transparent: true, side: THREE.DoubleSide, depthTest: false, toneMapped: false }));
+panel.renderOrder = 1000; panel.visible = false; scene.add(panel);
+
+function fnSet(u, k) { return function () { u.set(k); }; }               // bind per item: closures over the loop variable would all see the last item
+function fnChip(u, j) { return function () { u.items()[j].fn(); }; }
+function vrBuild() {                                         // lay the schema out as labelled, clickable rectangles
+  var hits = [], labels = [], y = 100, pad = 30, gap = 12, BH = 80, idc = 0;
+  function btn(x, yy, w, label, on, fn, kind) { hits.push({ id: idc++, x: x, y: yy, w: w, h: BH, label: label, on: on, fn: fn, kind: kind || '' }); }
+  var i = 0;
+  hits.push({ id: idc++, x: vrW - pad - 150, y: 20, w: 150, h: 64, label: 'Close', fn: function () { closePanel(); }, kind: 'close' });
+  while (i < UI.length) {
+    var u = UI[i];
+    if (u.type === 'seg') {
+      labels.push({ x: pad, y: y + 14, text: u.label.toUpperCase(), size: 26 }); y += 38;
+      var n = u.opts.length, bw = (vrW - 2 * pad - (n - 1) * gap) / n;
+      u.opts.forEach(function (o, j) { btn(pad + j * (bw + gap), y, bw, o[1], u.get() === o[0], fnSet(u, o[0])); });
+      y += BH + 24; i++;
+    } else if (u.type === 'chips') {
+      labels.push({ x: pad, y: y + 14, text: u.label.toUpperCase(), size: 26 }); y += 38;
+      var x = pad, bw2 = 138;
+      u.items().forEach(function (it, j) {
+        if (x + bw2 > vrW - pad + 1) { x = pad; y += BH + gap; }
+        btn(x, y, bw2, it.label, it.on, fnChip(u, j), it.on === undefined ? 'act' : '');
+        x += bw2 + gap;
+      });
+      y += BH + 24; i++;
+    } else if (u.type === 'step') {
+      var run = []; while (i < UI.length && UI[i].type === 'step') { run.push(UI[i]); i++; }
+      var colW = (vrW - 2 * pad - 40) / 2;
+      run.forEach(function (s, j) {
+        var cx = pad + (j % 2) * (colW + 40), cy = y + Math.floor(j / 2) * (BH + 12);
+        labels.push({ x: cx, y: cy + BH / 2, text: s.label, size: 28, color: C.dim });
+        var minus = (function (ss) { return function () { ss.set(clamp(ss.get() - ss.inc, ss.min, ss.max)); }; })(s);
+        var plus = (function (ss) { return function () { ss.set(clamp(ss.get() + ss.inc, ss.min, ss.max)); }; })(s);
+        hits.push({ id: idc++, x: cx + colW - 330, y: cy, w: 80, h: BH, label: '−', fn: minus, kind: 'step' });
+        labels.push({ x: cx + colW - 165, y: cy + BH / 2, text: s.fmt(s.get()), size: 34, color: C.text, align: 'center' });
+        hits.push({ id: idc++, x: cx + colW - 80, y: cy, w: 80, h: BH, label: '+', fn: plus, kind: 'step' });
+      });
+      y += Math.ceil(run.length / 2) * (BH + 12) + 18;
+    } else if (u.type === 'toggle') {
+      var bw3 = (vrW - 2 * pad - gap) / 2, k2 = 0;
+      while (i < UI.length && UI[i].type === 'toggle') {
+        var tu = UI[i]; btn(pad + (k2 % 2) * (bw3 + gap), y + Math.floor(k2 / 2) * (BH + gap), bw3, tu.label, tu.get(), (function (t2) { return function () { t2.set(!t2.get()); }; })(tu));
+        k2++; i++;
+      }
+      y += Math.ceil(k2 / 2) * (BH + gap) + 12;
+    } else i++;
+  }
+  return { hits: hits, labels: labels, H: y + 20 };
+}
+function vrDraw(Lo) {
+  var c = pctx, W = vrW, H = pcv.height;
+  c.clearRect(0, 0, W, H);
+  rr(c, 4, 4, W - 8, H - 8, 44); c.fillStyle = 'rgba(10,16,30,.97)'; c.fill(); c.lineWidth = 4; c.strokeStyle = 'rgba(125,155,215,.45)'; c.stroke();
+  c.textBaseline = 'middle'; font(c, 700, 50); c.fillStyle = C.text; c.textAlign = 'left'; c.fillText('Settings', 30, 52);
+  Lo.labels.forEach(function (l) { font(c, 600, l.size); c.fillStyle = l.color || C.faint; c.textAlign = l.align || 'left'; c.fillText(l.text, l.x, l.y); });
+  Lo.hits.forEach(function (b) {
+    rr(c, b.x, b.y, b.w, b.h, 18);
+    c.fillStyle = b.on ? '#2a5bd7' : (b.kind === 'act' ? 'rgba(18,29,54,.5)' : '#16223d'); c.fill();
+    if (vrHover === b.id) { c.fillStyle = 'rgba(255,255,255,.16)'; c.fill(); }
+    c.lineWidth = vrHover === b.id ? 5 : 3; c.strokeStyle = vrHover === b.id ? '#9cc0ff' : (b.on ? '#4b7cf0' : '#2c4272');
+    if (b.kind === 'act') c.setLineDash([10, 8]); c.stroke(); c.setLineDash([]);
+    c.fillStyle = b.on ? '#fff' : C.text; fitText(c, b.label, b.x + b.w / 2, b.y + b.h / 2 + 2, b.w - 20, b.kind === 'step' ? 700 : 600, b.kind === 'step' ? 56 : 34, 'center');
+  });
+}
+function vrEnsure(H) {                                       // resize canvas + plane when the layout height changes
+  if (pcv.height === H) return;
+  pcv.height = H;
+  panel.geometry.dispose(); panel.geometry = new THREE.PlaneGeometry(1.5, 1.5 * H / vrW);
+  ptex.dispose(); ptex = new THREE.CanvasTexture(pcv); ptex.encoding = THREE.sRGBEncoding; ptex.anisotropy = aniso;
+  panel.material.map = ptex; panel.material.needsUpdate = true;
+}
+function vrRefresh() {
+  var Lo = vrBuild(); vrEnsure(Lo.H); vrLayoutCache = Lo; vrDraw(Lo); ptex.needsUpdate = true;
+}
+function vrPick(x, y) {
+  if (!vrLayoutCache) return null;
+  for (var i = vrLayoutCache.hits.length - 1; i >= 0; i--) {
+    var b = vrLayoutCache.hits[i];
+    if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+  }
+  return null;
+}
+function openPanel() {
+  camera.updateMatrixWorld(); camera.getWorldPosition(_p); camera.getWorldDirection(_d);
+  _d.y = clamp(_d.y, -0.25, 0.25); var len = Math.sqrt(_d.x * _d.x + _d.y * _d.y + _d.z * _d.z) || 1;
+  panel.position.set(_p.x + _d.x / len * 1.35, _p.y - 0.08 + _d.y / len * 1.35, _p.z + _d.z / len * 1.35);
+  panel.lookAt(_p.x, panel.position.y, _p.z);
+  panel.updateMatrixWorld();
+  panelOpen = true; panel.visible = true; vrDirty = true;
+  ctrl.forEach(function (c) { if (c.userData.line) c.userData.line.visible = true; });
+}
+function closePanel() {
+  panelOpen = false; panel.visible = false; vrHover = null;
+  ctrl.forEach(function (c) { if (c.userData.line) c.userData.line.visible = false; });
+}
+
+/* ---------- controllers ---------- */
+var ray = new THREE.Raycaster(), _m = new THREE.Matrix4();
+var ctrl = [0, 1].map(function (i) {
+  var c = renderer.xr.getController(i);
+  var lg = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+  var line = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0x7fb2ff }));
+  line.visible = false; line.scale.z = 3; c.add(line); c.userData.line = line;
+  c.addEventListener('connected', function (e) { c.userData.src = e.data; });
+  c.addEventListener('disconnected', function () { c.userData.src = null; });
+  scene.add(c);
+  return c;
+});
+function vrRay(c) {                                          // where does this controller's laser hit the panel?
+  _m.identity().extractRotation(c.matrixWorld);
+  ray.ray.origin.setFromMatrixPosition(c.matrixWorld);
+  ray.ray.direction.set(0, 0, -1).applyMatrix4(_m);
+  var h = ray.intersectObject(panel, false);
+  return h && h.length ? h[0] : null;
+}
+
+/* ======================================================================
+   DESKTOP / PHONE CONTROLS
+   ====================================================================== */
+var yaw = 0, pitch = MU.degToRad(32), dragging = false, lx = 0, ly = 0;
+function applyView() { camera.rotation.set(pitch, yaw, 0); }
+function onResize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.fov = camera.aspect < 1 ? 95 : 70; camera.updateProjectionMatrix();
+}
+renderer.domElement.addEventListener('pointerdown', function (e) { dragging = true; lx = e.clientX; ly = e.clientY; try { renderer.domElement.setPointerCapture(e.pointerId); } catch (x) {} });
+renderer.domElement.addEventListener('pointerup', function () { dragging = false; });
+renderer.domElement.addEventListener('pointercancel', function () { dragging = false; });
+renderer.domElement.addEventListener('pointermove', function (e) {
+  if (!dragging || renderer.xr.isPresenting) return;
+  var k = 0.0045 * (camera.fov / 70);
+  yaw += (e.clientX - lx) * k; pitch = clamp(pitch + (e.clientY - ly) * k, -1.2, 1.55); lx = e.clientX; ly = e.clientY; applyView();
+});
+renderer.domElement.addEventListener('wheel', function (e) {
+  e.preventDefault(); camera.fov = clamp(camera.fov + e.deltaY * 0.03, 35, 110); camera.updateProjectionMatrix();
+}, { passive: false });
+window.addEventListener('resize', onResize);
+window.addEventListener('keydown', function (e) { if (e.code === 'Space') { e.preventDefault(); setPaused(!paused); } });
+$('btnPause').addEventListener('click', function () { setPaused(!paused); });
+$('btnGear').addEventListener('click', function () { var p = $('panel'); p.hidden = !p.hidden; });
+
+/* ---------- headset sessions (VR and passthrough) ---------- */
+var xrFrames = 0, pad = {}, presetIdx = 1, lastSpeedToast = 0;
+function recenter() {
+  camera.updateMatrixWorld(); camera.getWorldPosition(_p); camera.getWorldDirection(_d);
+  rig.position.copy(_p); rig.rotation.y = Math.atan2(-_d.x, -_d.z);
+  toast('Recentered');
+}
+function pollXR(dt) {
+  var hoverNow = null;
+  ctrl.forEach(function (c, ci) {
+    var src = c.userData.src, gp = src && src.gamepad; if (!gp) return;
+    var st = pad[ci] || (pad[ci] = {});
+    var edge = function (i, fn) { var now = !!(gp.buttons[i] && gp.buttons[i].pressed); if (now && !st[i]) fn(); st[i] = now; };
+    var hit = panelOpen ? vrRay(c) : null, pt = null, over = null;
+    if (hit && hit.uv) { pt = { x: hit.uv.x * vrW, y: (1 - hit.uv.y) * pcv.height }; over = vrPick(pt.x, pt.y); if (over && hoverNow === null) hoverNow = over.id; }
+    if (c.userData.line) c.userData.line.scale.z = hit && hit.distance ? hit.distance : 3;
+    edge(0, function () {                                       // trigger: click when the menu is open, otherwise pause
+      if (panelOpen) { if (over) act(over.fn); }
+      else { setPaused(!paused); toast(paused ? 'Paused' : 'Playing'); }
+    });
+    edge(5, function () { if (panelOpen) closePanel(); else openPanel(); });      // B / Y: settings panel
+    edge(4, recenter);                                           // A / X: recenter the ticker around you
+    if (!panelOpen) {
+      edge(1, function () { presetIdx = (presetIdx + 1) % PRESETS.length; setTilt(PRESETS[presetIdx]); toast('Tilt ' + CFG.tilt + '°'); });
+      var y = gp.axes[3] || 0;                                   // thumbstick up/down: speed
+      if (Math.abs(y) > 0.35) {
+        CFG.speed = clamp(CFG.speed - y * dt * 5, 0, 15); syncUI();
+        if (performance.now() - lastSpeedToast > 600) { lastSpeedToast = performance.now(); saveSettings(); toast('Speed ' + CFG.speed.toFixed(1) + '°/s'); }
+      }
+    }
+  });
+  var hid = hoverNow; if (!panelOpen) hid = null;
+  if (hid !== vrHover) { vrHover = hid; vrDirty = true; }
+}
+function onXREnd() {
+  xrMode = 'none'; applyEnv(); closePanel();
+  rig.position.set(0, CFG.eye, 0); rig.rotation.y = 0; camera.position.set(0, CFG.eye, 0); applyView(); onResize();
+  $('btnVR').textContent = 'Enter VR'; $('btnAR').textContent = 'Passthrough';
+}
+var btnVR = $('btnVR'), btnAR = $('btnAR');
+async function startXR(mode) {
+  var cur = renderer.xr.getSession(); if (cur) { cur.end(); return; }
+  try {
+    var session = await navigator.xr.requestSession(mode === 'ar' ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
+    xrMode = mode; applyEnv();
+    renderer.xr.setReferenceSpaceType('local-floor');
+    await renderer.xr.setSession(session);
+    session.addEventListener('end', onXREnd, { once: true });
+    xrFrames = 0; bump();
+  } catch (err) {
+    console.warn(err); xrMode = 'none'; applyEnv();
+    (mode === 'ar' ? btnAR : btnVR).textContent = 'Could not start';
+  }
+}
+(async function initXR() {
+  if (!navigator.xr) { btnVR.textContent = 'VR not available'; return; }
+  try {
+    if (await navigator.xr.isSessionSupported('immersive-vr')) { btnVR.disabled = false; btnVR.textContent = 'Enter VR'; btnVR.classList.add('primary'); }
+    else btnVR.textContent = 'No headset found';
+  } catch (err) { btnVR.textContent = 'VR blocked here'; }
+  try {
+    if (await navigator.xr.isSessionSupported('immersive-ar')) { btnAR.hidden = false; btnAR.disabled = false; }
+  } catch (err) {}
+})();
+btnVR.addEventListener('click', function () { startXR('vr'); });
+btnAR.addEventListener('click', function () { startXR('ar'); });
+
+/* ---------- feeds ---------- */
+function useFeed(feed) {
+  store.clear(); rows.forEach(function (r) { r.list = []; });
+  feed.start(ingest);
+}
+window.OddsTicker = { CFG: CFG, ingest: ingest, useFeed: useFeed, createSimFeed: createSimFeed, createOddsApiFeed: createOddsApiFeed, store: store,
+  _dbg: { UI: UI, rows: rows, vrBuild: vrBuild, vrRefresh: vrRefresh, vrPick: vrPick, act: act, pcv: pcv, openPanel: openPanel, closePanel: closePanel, pollXR: pollXR, LEAGUE_ORDER: LEAGUE_ORDER, isPanelOpen: function () { return panelOpen; }, isPaused: function () { return paused; } } };
+
+/* ---------- main loop ---------- */
+var last = performance.now();
+renderer.setAnimationLoop(function (now) {
+  var dt = Math.min(0.05, Math.max(0, (now - last) / 1000)); last = now;
+  if (renderer.xr.isPresenting) { pollXR(dt); if (++xrFrames === 20) recenter(); }
+  if (uiStale) { uiStale = false; domBuild(); }
+  if (!paused) theta += CFG.speed * dt * (CFG.reverse ? -1 : 1);
+  var g = geo(); rows.forEach(function (r) { layoutRow(r, g); });
+  if (budgetBoost > 0) budgetBoost--;
+  if (panelOpen && vrDirty) { vrRefresh(); vrDirty = false; }
+  if (toastSprite.visible && performance.now() > toastUntil) toastSprite.visible = false;
+  renderer.render(scene, camera);
+});
+
+/* ---------- boot ---------- */
+loadSettings();
+onResize(); applyView(); applyEnv(); domBuild(); applyGeometry();
+useFeed(createSimFeed());
+if (document.fonts && document.fonts.load) {
+  Promise.race([
+    Promise.all([document.fonts.load('700 40px "Barlow Condensed"'), document.fonts.load('600 20px "Barlow Condensed"')]),
+    new Promise(function (r) { setTimeout(r, 3000); })
+  ]).then(function () { bump(); }, function () {});
+}
+setTimeout(function () { $('hint').style.opacity = 0; }, 7000);
+})();
+</script>
+</body>
+</html>
