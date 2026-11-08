@@ -1,0 +1,1927 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VR Odds Ticker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&display=swap">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #03060d; overflow: hidden; color: #e8efff;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #stage canvas:active { cursor: grabbing; }
+  .tag { position: fixed; left: 14px; top: 12px; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: #7f93ba; pointer-events: none; }
+  .tag b { color: #ff7a8a; font-weight: 600; }
+  .tag b.live { color: #38e58f; }
+  .tag b.warn { color: #ffc247; }
+  .status { margin: -4px 0 12px; font-size: 12px; line-height: 1.45; color: #9fb0d4; }
+  #msg { position: fixed; left: 0; right: 0; top: 40%; text-align: center; color: #ff9aa6; padding: 0 24px; }
+  #bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; gap: 8px; padding: 8px;
+    border-radius: 16px; background: rgba(10,16,30,.84); border: 1px solid rgba(120,150,210,.25); backdrop-filter: blur(8px); }
+  button { font: inherit; font-size: 14px; color: #e8efff; background: #17233f; border: 1px solid #2b3f68;
+    border-radius: 10px; padding: 10px 14px; cursor: pointer; white-space: nowrap; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #2a5bd7; border-color: #4b7cf0; }
+  #panel { position: fixed; left: 50%; bottom: 76px; transform: translateX(-50%); width: min(94vw, 400px); max-height: 68vh;
+    overflow-y: auto; padding: 14px 16px 10px; border-radius: 16px; background: rgba(10,16,30,.94);
+    border: 1px solid rgba(120,150,210,.25); backdrop-filter: blur(10px); font-size: 13px; }
+  #panel[hidden] { display: none; }
+  .sec { margin: 0 0 12px; }
+  .lab { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: #7f93ba; margin: 0 0 6px; }
+  .grp { display: flex; flex-wrap: wrap; gap: 6px; }
+  .opt { padding: 8px 12px; font-size: 13px; border-radius: 9px; background: #121d36; flex: 1 1 auto; }
+  .opt.on { background: #2a5bd7; border-color: #4b7cf0; color: #fff; }
+  .opt.act { background: transparent; border-style: dashed; color: #a9b9db; }
+  .stepline { display: grid; grid-template-columns: 74px 1fr 66px; gap: 8px; align-items: center; margin: 4px 0; color: #a9b9db; }
+  .stepline output { text-align: right; color: #e8efff; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: #4b7cf0; }
+  .tog { display: flex; align-items: center; gap: 8px; margin: 6px 0; color: #a9b9db; }
+  .note { margin: 12px 0 2px; color: #7f93ba; font-size: 12px; line-height: 1.5; }
+  #hint { position: fixed; left: 50%; top: 14%; transform: translateX(-50%); padding: 8px 14px; border-radius: 999px;
+    background: rgba(10,16,30,.78); color: #b9c7e6; font-size: 13px; pointer-events: none; transition: opacity .8s; text-align: center; max-width: 92vw; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div class="tag">Odds ticker &middot; <b id="srcTag">connecting&hellip;</b></div>
+<div id="msg"></div>
+<div id="hint">Drag to look around &middot; scroll to zoom &middot; Settings for leagues, scores/odds and layout</div>
+<div id="panel" hidden></div>
+<div id="bar">
+  <button id="btnVR" disabled>Checking VR&hellip;</button>
+  <button id="btnAR" disabled hidden>Passthrough</button>
+  <button id="btnPause">Pause</button>
+  <button id="btnGear">Settings</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+'use strict';
+var $ = function (id) { return document.getElementById(id); };
+if (!window.THREE) { $('msg').textContent = 'Could not load Three.js from the CDN. Check your connection and reload.'; return; }
+var MU = THREE.MathUtils;
+
+/* ======================================================================
+   SETTINGS (all of these are editable from the Settings panel and are
+   remembered between visits where the browser allows it)
+   ====================================================================== */
+var CFG = {
+  radius: 4,          // metres from the viewer to the ticker surface
+  cardPx: [512, 320], // card canvas size
+  logos: true,        // team logos on the cards (from github.com/klunn91/team-logos)
+  logoBase: '',       // optional: your own copy of that repo's folders, e.g. './team-logos/'
+  source: 'live',     // 'live' = ESPN scores + Polymarket prices | 'sim' = simulator
+  proxy: '',          // optional CORS proxy for the live feeds (see createLiveFeed)
+  content: 'both',    // 'both' | 'scores' | 'odds'
+  fmt: 'us',          // odds format: 'us' | 'dec' | 'pct'
+  tilt: 25,           // 0 = ribbon above the horizon, 90 = arch straight over your head
+  size: 1,            // card size multiplier
+  arc: 180,           // visible arc in degrees
+  speed: 4,           // degrees per second
+  reverse: false,     // scroll direction
+  brightness: 1,
+  opacity: 1,
+  env: true,          // floor grid + stars in VR (never shown in passthrough)
+  leagues: {},        // league -> false when hidden
+  rows: { live: true, lines: true, moves: true, box: false, props: false },   // box + props are opt-in
+  propsFor: 'all',    // player-props row: 'all' | 'live' | 'pre' games
+  eye: 1.6            // desktop eye height, metres
+};
+var BASE = { cardW: 20, pitch: 21, rowH: 12.5, gap: 1 };      // degrees at size 1
+var NCARDS = 16;                                               // card meshes per row
+var FLASH_MS = 6000, SCORE_MS = 4500;
+var PRESETS = [0, 25, 55, 90];
+var LEAGUE_ORDER = ['NFL', 'NBA', 'NHL', 'NCAAF', 'EPL'];
+var uiStale = false;
+var MAX_STACK = 48;                                          // degrees: the tallest a stack of rows may get at Size 100% (about 4 rows)
+function geo() {
+  var n = Math.max(1, ROW_ORDER.filter(function (k) { return rowOn(rowByKey[k]); }).length), full = n * BASE.rowH + (n - 1) * BASE.gap;
+  var fit = full > MAX_STACK ? MAX_STACK / full : 1;           // 5 rows -> cards at ~72%, so the top row stays within comfortable neck range
+  var s = fit < 1 ? Math.max(0.6, CFG.size * fit) : CFG.size;  // never so small that the 16 cards no longer cover the visible arc
+  return { cardW: BASE.cardW * s, pitch: BASE.pitch * s, rowH: BASE.rowH * s, gap: BASE.gap * s, fadeEnd: CFG.arc / 2 + 8, fadeStart: CFG.arc / 2 - 12 };
+}
+function leagueOn(l) { return CFG.leagues[l] !== false; }
+function showScores() { return CFG.content !== 'odds'; }
+function showOdds() { return CFG.content !== 'scores'; }
+function hasOdds(t) { return !!t.ml && t.ml.home != null && t.ml.away != null; }
+function showable(t) { return leagueOn(t.league) && (showScores() || hasOdds(t)); }   // 'Odds' mode hides games that have no prices
+
+/* ======================================================================
+   SMALL HELPERS
+   ====================================================================== */
+var rand = function (a, b) { return a + Math.random() * (b - a); };
+var pick = function (a) { return a[Math.floor(Math.random() * a.length)]; };
+var clamp = function (x, a, b) { return Math.min(b, Math.max(a, x)); };
+var roundHalf = function (x) { return Math.round(x * 2) / 2; };
+var logistic = function (z) { return 1 / (1 + Math.exp(-z)); };
+function randn() { var u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+function pickTwo(arr) { var a = arr.slice(); for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return [a[0], a[1]]; }
+function toAmerican(q) {
+  q = clamp(q, 0.03, 0.97);
+  var o = q >= 0.5 ? -100 * q / (1 - q) : 100 * (1 - q) / q;
+  o = Math.round(o / 5) * 5;
+  if (Math.abs(o) < 100) o = o < 0 ? -100 : 100;
+  return o;
+}
+function qOf(o) { if (o == null) return null; return o < 0 ? -o / (-o + 100) : 100 / (o + 100); }       // American odds -> implied prob
+function pHomeOf(ml) { var a = qOf(ml.home), b = qOf(ml.away); return (a == null || b == null) ? null : a / (a + b); }
+function fmtO(n) {                                                                                      // price in the chosen format
+  if (n == null) return '—';
+  if (CFG.fmt === 'dec') return (n > 0 ? 1 + n / 100 : 1 + 100 / -n).toFixed(2);
+  if (CFG.fmt === 'pct') return Math.round(qOf(n) * 100) + '%';
+  return n > 0 ? '+' + n : '−' + Math.abs(n);
+}
+function fmtLine(x) { return x == null ? '—' : x === 0 ? 'PK' : (x > 0 ? '+' : '−') + Math.abs(x); }
+function fmtStart(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' }).replace(',', '').toUpperCase();
+}
+
+/* ======================================================================
+   DATA MODEL  (what the ticker consumes - any feed just has to produce this)
+
+   {
+     id, league, state: 'pre' | 'live' | 'final',
+     home: {name, abbr}, away: {name, abbr},
+     clock: 'Q3 8:42' | "67'" | '',   startTime: ms epoch,
+     score: {home, away} | null,
+     ml:     {home, away},                       // American odds
+     spread: {line, home, away},                 // line is from the HOME side, prices American
+     total:  {line, over, under},
+     lastScore: {side:'home'|'away', at: ms}     // optional, highlights the score briefly
+     open:   {pHome, ml:{home,away}}             // optional, otherwise first-seen values are used
+     simulated: true                             // optional, prints a SIMULATED DATA tag on the cards
+     tag: 'ESPN · POLYMARKET ODDS'               // optional, small source label printed on the cards
+     box:    {labels:['Q1',..], away:[7,3,..], home:[..], cur: periodIndex,       // optional, drives the Box score row
+              leaders:{away:[{c:'PTS', n:'J. Smith', v:'28'}], home:[..]}, goals:[{t:"23'", n:'Name', side:'home'}]}
+     boxSig: 'string'                            // changes whenever `box` changes (redraw trigger)
+     props:  [{name, stat:'PTS', line:24.5, kind:'ou'|'yn', p: probability of Over/Yes, thin: bool}]   // optional, Props row
+     propsSig: 'string'                          // changes whenever `props` changes
+   }
+   Games with no prices (ml = {}) are fine: they show as scores-only cards / schedule cards.
+   Unknown league names are fine: they get their own toggle in Settings.
+   ====================================================================== */
+var LEAGUES = {
+  NFL:   { color: '#4aa3ff', total: 3600, periods: 4, tick: 8,  events: 8.7, steps: [3, 7, 7, 6, 3],       scale: 6,   totalBase: 46,  sens: 0.12,  clock: 'Q' },
+  NBA:   { color: '#ff8a4c', total: 2880, periods: 4, tick: 7,  events: 104, steps: [2, 2, 2, 3, 1, 3],    scale: 6,   totalBase: 226, sens: 0.075, clock: 'Q' },
+  NHL:   { color: '#6fe0ff', total: 3600, periods: 3, tick: 8,  events: 6,   steps: [1],                   scale: 0.6, totalBase: 6,   sens: 0.55,  clock: 'P' },
+  NCAAF: { color: '#ffc247', total: 3600, periods: 4, tick: 8,  events: 9,   steps: [7, 7, 3, 6, 7],       scale: 9,   totalBase: 55,  sens: 0.09,  clock: 'Q' },
+  EPL:   { color: '#b88bff', total: 5400, periods: 2, tick: 12, events: 2.7, steps: [1],                   scale: 0.6, totalBase: 2.7, sens: 0.9,   clock: 'min' }
+};
+function T(abbr, name) { return { abbr: abbr, name: name }; }
+var TEAMS = {
+  NFL: [T('KC','Chiefs'),T('BUF','Bills'),T('PHI','Eagles'),T('DET','Lions'),T('BAL','Ravens'),T('SF','49ers'),T('DAL','Cowboys'),T('GB','Packers'),T('MIN','Vikings'),T('HOU','Texans'),T('LAC','Chargers'),T('SEA','Seahawks')],
+  NBA: [T('BOS','Celtics'),T('OKC','Thunder'),T('DEN','Nuggets'),T('NYK','Knicks'),T('LAL','Lakers'),T('MIL','Bucks'),T('PHX','Suns'),T('GSW','Warriors'),T('MIA','Heat'),T('CLE','Cavaliers'),T('MIN','Wolves'),T('DAL','Mavericks')],
+  NHL: [T('EDM','Oilers'),T('FLA','Panthers'),T('COL','Avalanche'),T('NYR','Rangers'),T('VGK','Golden Knights'),T('TOR','Maple Leafs'),T('DAL','Stars'),T('CAR','Hurricanes'),T('BOS','Bruins'),T('WPG','Jets')],
+  NCAAF: [T('UGA','Georgia'),T('OSU','Ohio State'),T('TEX','Texas'),T('ORE','Oregon'),T('ALA','Alabama'),T('MICH','Michigan'),T('ND','Notre Dame'),T('PSU','Penn State'),T('CLEM','Clemson'),T('LSU','LSU')],
+  EPL: [T('ARS','Arsenal'),T('MCI','Man City'),T('LIV','Liverpool'),T('CHE','Chelsea'),T('TOT','Spurs'),T('NEW','Newcastle'),T('AVL','Aston Villa'),T('BHA','Brighton'),T('MUN','Man United'),T('WHU','West Ham')]
+};
+
+/* ======================================================================
+   FEED 1: SIMULATOR (default).  Random-walk odds so the ticker looks alive.
+   ====================================================================== */
+function clockText(L, elapsed) {
+  if (elapsed >= L.total) return 'FINAL';
+  if (L.clock === 'min') return Math.min(90, Math.floor(elapsed / 60) + 1) + "'";
+  var plen = L.total / L.periods;
+  var p = Math.min(L.periods, Math.floor(elapsed / plen) + 1);
+  var left = Math.max(0, plen - (elapsed - (p - 1) * plen));
+  var ss = Math.floor(left % 60);
+  return L.clock + p + ' ' + Math.floor(left / 60) + ':' + (ss < 10 ? '0' : '') + ss;
+}
+
+function periodNames(league, n) {                                    // column headers of the box score
+  var a = [];
+  for (var p = 1; p <= n; p++) a.push(league === 'EPL' ? (p === 1 ? '1H' : p === 2 ? '2H' : 'ET')
+    : league === 'NHL' ? (p <= 3 ? 'P' + p : p === 4 ? 'OT' : 'SO')
+    : league === 'NBA' ? (p <= 4 ? 'Q' + p : 'OT' + (p > 5 ? p - 4 : ''))
+    : (p <= 4 ? 'Q' + p : 'OT'));
+  return a;
+}
+var SIM_NAMES = ['J. Alvarez', 'T. Brooks', 'M. Chen', 'D. Okafor', 'R. Lindqvist', 'K. Mbeki', 'A. Petrov', 'S. Navarro', 'C. Whitfield', 'L. Haddad', 'B. Torres', 'E. Nakamura', 'P. Dubois', 'G. Rossi', 'H. Kim', 'N. Adeyemi'];
+var SIM_PROPS = {                                                    // [stat, base line, kind]  (made-up players, demo numbers)
+  NBA:   [['PTS', 26.5, 'ou'], ['PTS', 19.5, 'ou'], ['PTS', 13.5, 'ou'], ['REB', 9.5, 'ou'], ['REB', 6.5, 'ou'], ['AST', 7.5, 'ou']],
+  NFL:   [['PASS YDS', 249.5, 'ou'], ['RUSH YDS', 64.5, 'ou'], ['RUSH YDS', 48.5, 'ou'], ['REC YDS', 71.5, 'ou'], ['REC YDS', 52.5, 'ou'], ['ANY TD', 0, 'yn'], ['ANY TD', 0, 'yn']],
+  NCAAF: [['PASS YDS', 229.5, 'ou'], ['RUSH YDS', 74.5, 'ou'], ['REC YDS', 61.5, 'ou'], ['ANY TD', 0, 'yn']]
+};
+
+function SimGame(league, live, id, fresh) {
+  var L = LEAGUES[league];
+  this.L = L; this.league = league; this.id = id; this.live = live;
+  var two = pickTwo(TEAMS[league]);
+  this.away = two[0]; this.home = two[1];
+  this.m0 = clamp(randn() * L.scale * 0.75 + 0.1 * L.scale, -1.6 * L.scale, 1.6 * L.scale);   // home edge in points/goals
+  this.m = live ? this.m0 : this.m0 + randn() * L.scale * 0.18;            // pre-game lines have already drifted a bit
+  this.total0 = roundHalf(L.totalBase * rand(0.93, 1.07));
+  this.tAdj = 0; this.sj = 0; this.tj = 0;
+  this.elapsed = 0; this.hs = 0; this.as = 0; this.noise = 0; this.finalTicks = 0; this.lastScore = null;
+  this.per = { home: [], away: [] }; this.goals = [];                       // points per period / scoring log for the box score
+  var nm = SIM_NAMES.slice().sort(function () { return Math.random() - 0.5; });
+  this.pn = { home: nm.slice(0, 3), away: nm.slice(3, 6) };
+  this.pm = { home: [rand(0.75, 1.25), rand(0.7, 1.2), rand(0.7, 1.2)], away: [rand(0.75, 1.25), rand(0.7, 1.2), rand(0.7, 1.2)] };
+  this.props = (SIM_PROPS[league] || []).map(function (d, i) {
+    return { name: nm[6 + (i % 10)], stat: d[0], line: d[1] ? Math.floor(d[1] * rand(0.85, 1.15)) + 0.5 : 0, kind: d[2], p: d[2] === 'yn' ? rand(0.15, 0.6) : clamp(0.5 + randn() * 0.07, 0.3, 0.7) };
+  });
+  this.startTime = Math.round((Date.now() + rand(0.5, 10) * 3600e3) / 300e3) * 300e3;
+  this.openP = logistic(this.m0 / L.scale * 0.9);
+  this.openML = { home: toAmerican(this.openP * 1.045), away: toAmerican((1 - this.openP) * 1.045) };
+  if (live) {
+    var target = fresh ? rand(0, 0.03) * L.total : rand(0.05, 0.85) * L.total;
+    while (this.elapsed < target) this.step(L.tick * 1.5);
+    this.lastScore = null;
+  }
+}
+SimGame.prototype.step = function (dt) {
+  var L = this.L;
+  if (this.live) {
+    this.elapsed = Math.min(L.total, this.elapsed + dt);
+    if (this.elapsed < L.total && Math.random() < (L.events / L.total) * dt) {
+      var homeShare = clamp(0.5 + this.m0 / (2 * L.totalBase), 0.35, 0.65);
+      var side = Math.random() < homeShare ? 'home' : 'away';
+      var pts = pick(L.steps);
+      if (side === 'home') this.hs += pts; else this.as += pts;
+      var pi = Math.min(L.periods - 1, Math.floor(this.elapsed / (L.total / L.periods)));
+      this.per[side][pi] = (this.per[side][pi] || 0) + pts;
+      this.goals.push({ t: L.clock === 'min' ? Math.min(90, Math.floor(this.elapsed / 60) + 1) + "'" : L.clock + (pi + 1), n: pick(this.pn[side]), side: side });
+      this.lastScore = { side: side, at: Date.now() };
+    }
+    this.noise = clamp(this.noise * 0.93 + randn() * 0.03, -0.45, 0.45);
+  } else {
+    if (Math.random() < 0.22) this.m = clamp(this.m + randn() * L.scale * 0.04, this.m0 - L.scale * 0.6, this.m0 + L.scale * 0.6);
+    if (Math.random() < 0.05) this.tAdj += pick([-0.5, 0.5]);
+  }
+  this.props.forEach(function (q) { if (Math.random() < 0.3) q.p = clamp(q.p + pick([-0.01, 0.01, 0.02, -0.02]), 0.05, 0.9); });
+  if (Math.random() < 0.12) this.sj = clamp(this.sj + pick([-1, 1]), -2, 2);
+  if (Math.random() < 0.12) this.tj = clamp(this.tj + pick([-1, 1]), -2, 2);
+};
+SimGame.prototype.isFinal = function () { return this.live && this.elapsed >= this.L.total; };
+SimGame.prototype.boxData = function () {                            // demo box score: per-period tallies + leaders built from the running score
+  var L = this.L, frac = this.elapsed / L.total, cur = Math.min(L.periods - 1, Math.floor(this.elapsed / (L.total / L.periods))), box = { labels: periodNames(this.league, L.periods), away: [], home: [], cur: cur, leaders: { away: [], home: [] }, goals: [] };
+  var fin = this.elapsed >= L.total, me = this;
+  ['away', 'home'].forEach(function (side) {
+    for (var i = 0; i < L.periods; i++) box[side].push(i > cur && !fin ? null : (me.per[side][i] || 0));
+    var ts = side === 'home' ? me.hs : me.as, m = me.pm[side], nn = me.pn[side], out = box.leaders[side], add = function (c, i, v, unit) { if (v > 0) out.push({ c: c, n: nn[i], v: String(v) + (unit || '') }); };
+    if (me.league === 'NBA') { add('PTS', 0, Math.round(ts * 0.27 * m[0])); add('REB', 1, Math.round(frac * 11 * m[1])); add('AST', 2, Math.round(frac * 9 * m[2])); }
+    else if (me.league === 'NFL' || me.league === 'NCAAF') { add('PASS', 0, Math.round(frac * 285 * m[0]), ' YDS'); add('RUSH', 1, Math.round(frac * 95 * m[1]), ' YDS'); add('REC', 2, Math.round(frac * 105 * m[2]), ' YDS'); }
+    else if (me.league === 'NHL') { add('G', 0, Math.ceil(ts * 0.5)); add('A', 1, Math.floor(ts * 0.7)); }
+  });
+  if (this.league === 'EPL' || this.league === 'NHL') box.goals = this.goals.slice(-4);
+  return box;
+};
+SimGame.prototype.snapshot = function () {
+  var L = this.L, rem = this.live ? 1 - this.elapsed / L.total : 1, lead = this.hs - this.as;
+  var z = (this.m / L.scale * 0.9) * rem + lead * L.sens / (0.2 + rem) + (this.live ? this.noise : 0);
+  var p = logistic(z);
+  if (this.live && rem <= 0.002) p = lead > 0 ? 0.97 : lead < 0 ? 0.03 : 0.5;
+  var pts = this.hs + this.as;
+  var out = {
+    id: this.id, league: this.league, simulated: true,
+    state: !this.live ? 'pre' : (rem <= 0.002 ? 'final' : 'live'),
+    home: this.home, away: this.away,
+    clock: this.live ? clockText(L, this.elapsed) : '',
+    startTime: this.startTime,
+    score: this.live ? { home: this.hs, away: this.as } : null,
+    lastScore: this.lastScore,
+    ml: { home: toAmerican(p * 1.045), away: toAmerican((1 - p) * 1.045) },
+    spread: { line: -roundHalf(lead + this.m * rem) || 0, home: -110 + 5 * this.sj, away: -110 - 5 * this.sj },
+    total: { line: roundHalf(pts + (this.total0 + this.tAdj) * rem), over: -110 + 5 * this.tj, under: -110 - 5 * this.tj },
+    open: { pHome: this.openP, ml: this.openML }
+  };
+  if (this.live) {
+    out.box = this.boxData();
+    out.boxSig = [this.hs, this.as, out.box.cur, JSON.stringify(out.box.leaders), out.box.goals.length].join('|');
+  }
+  if (this.props.length && out.state !== 'final') {
+    out.props = this.props.map(function (q) { return { name: q.name, stat: q.stat, line: q.line, kind: q.kind, p: q.p, thin: false }; });
+    out.propsSig = this.props.map(function (q) { return Math.round(q.p * 100); }).join(',');
+  }
+  return out;
+};
+
+function createSimFeed() {
+  var seq = 0, games = [];
+  var plan = [['NFL',1],['NFL',1],['NBA',1],['NBA',1],['NBA',1],['NHL',1],['NHL',1],['NCAAF',1],['EPL',1],
+              ['NFL',0],['NFL',0],['NBA',0],['NBA',0],['NHL',0],['NCAAF',0],['NCAAF',0],['EPL',0],['EPL',0],['NHL',0]];
+  plan.forEach(function (p) { games.push(new SimGame(p[0], !!p[1], ++seq, false)); });
+  function snap() { return games.map(function (g) { return g.snapshot(); }); }
+  var timer = null;
+  return {
+    isSimulated: true,
+    start: function (emit) {
+      emit(snap());
+      timer = setInterval(function () {
+        games.forEach(function (g, i) {
+          g.step(g.L.tick * 1.5);
+          if (g.isFinal() && ++g.finalTicks > 4) games[i] = new SimGame(g.league, true, ++seq, true);
+        });
+        emit(snap());
+      }, 1500);
+    },
+    stop: function () { clearInterval(timer); timer = null; }
+  };
+}
+
+/* ======================================================================
+   FEED 2: The Odds API (https://the-odds-api.com)  -  UNTESTED EXAMPLE
+   Needs an API key and a page that is allowed to call the API (a page hosted
+   on your own domain, not the sandboxed preview). Register it with:
+     OddsTicker.useFeed(OddsTicker.createOddsApiFeed({ apiKey: 'YOUR_KEY' }))
+   ====================================================================== */
+function createOddsApiFeed(opts) {
+  var sports = opts.sports || { americanfootball_nfl: 'NFL', americanfootball_ncaaf: 'NCAAF', basketball_nba: 'NBA', icehockey_nhl: 'NHL', soccer_epl: 'EPL' };
+  var every = opts.pollMs || 60000;
+  function team(n) { return { name: n, abbr: n.replace(/[^A-Za-z ]/g, '').split(' ').pop().slice(0, 3).toUpperCase() }; }
+  function find(book, key) { for (var i = 0; i < book.markets.length; i++) if (book.markets[i].key === key) return book.markets[i]; return null; }
+  function out(m, name) { if (!m) return null; for (var i = 0; i < m.outcomes.length; i++) if (m.outcomes[i].name === name) return m.outcomes[i]; return null; }
+  async function poll(emit) {
+    var all = [];
+    for (var key in sports) {
+      try {
+        var res = await fetch('https://api.the-odds-api.com/v4/sports/' + key + '/odds/?regions=' + (opts.regions || 'us') +
+          '&markets=h2h,spreads,totals&oddsFormat=american&apiKey=' + encodeURIComponent(opts.apiKey));
+        if (!res.ok) continue;
+        (await res.json()).forEach(function (g) {
+          var bk = g.bookmakers && g.bookmakers[0]; if (!bk) return;
+          var h2h = find(bk, 'h2h'), sp = find(bk, 'spreads'), tot = find(bk, 'totals');
+          var mh = out(h2h, g.home_team), ma = out(h2h, g.away_team), sh = out(sp, g.home_team), sa = out(sp, g.away_team);
+          var ov = out(tot, 'Over'), un = out(tot, 'Under');
+          var started = new Date(g.commence_time).getTime() < Date.now();
+          all.push({
+            id: g.id, league: sports[key], state: started ? 'live' : 'pre', startTime: new Date(g.commence_time).getTime(),
+            home: team(g.home_team), away: team(g.away_team), clock: '', score: null,
+            ml: { home: mh && mh.price, away: ma && ma.price },
+            spread: { line: sh ? sh.point : null, home: sh && sh.price, away: sa && sa.price },
+            total: { line: ov ? ov.point : null, over: ov && ov.price, under: un && un.price }
+          });
+        });
+      } catch (e) { console.warn('odds poll failed for', key, e); }
+    }
+    if (all.length) emit(all);
+  }
+  var oddsTimer = null;
+  return { isSimulated: false, start: function (emit) { poll(emit); oddsTimer = setInterval(function () { poll(emit); }, every); }, stop: function () { clearInterval(oddsTimer); } };
+}
+
+/* ======================================================================
+   FEED 3: LIVE  =  ESPN scoreboard JSON (scores, clock, state)  +  Polymarket Gamma API (prices)
+
+   ESPN decides which games exist and what the score is. Polymarket is matched onto each game by team
+   name (the order of Polymarket's outcomes is never trusted) and its probabilities are converted to
+   American odds, so every odds-format setting keeps working. These are prediction-market mid prices:
+   no bookmaker margin, not sportsbook lines. Both APIs are unofficial/undocumented-for-this-use and can
+   change, so every step is defensive and the status line tells you what was found.
+
+   If the browser blocks either API (CORS), route both through a tiny proxy of your own:
+       https://you.github.io/ticker/?proxy=https%3A%2F%2Fyour-worker.example%2F%3Fu%3D%7Burl%7D
+   ({url} is replaced by the encoded target URL; without {url} the target is appended.) Cloudflare Worker:
+       export default { async fetch(req) {
+         const u = new URL(req.url).searchParams.get('u') || '';
+         if (!/^https:\/\/(site\.api\.espn\.com|gamma-api\.polymarket\.com)\//.test(u)) return new Response('no', { status: 403 });
+         const r = await fetch(u);
+         return new Response(r.body, { status: r.status, headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } });
+       } }
+   ====================================================================== */
+function createLiveFeed(opts) {
+  opts = opts || {};
+  var ESPN = 'https://site.api.espn.com/apis/site/v2/sports/', GAMMA = 'https://gamma-api.polymarket.com/';
+  var LG = [
+    { key: 'NFL',   espn: 'football/nfl',              pmCodes: ['nfl'], pmTags: ['nfl'], propTypes: ['passing_yards', 'rushing_yards', 'receiving_yards', 'anytime_touchdowns'] },
+    { key: 'NCAAF', espn: 'football/college-football', pmCodes: ['cfb'], pmTags: ['cfb', 'college-football'], extra: '&groups=80' },
+    { key: 'NBA',   espn: 'basketball/nba',            pmCodes: ['nba'], pmTags: ['nba'], propTypes: ['points', 'rebounds', 'assists'] },
+    { key: 'NHL',   espn: 'hockey/nhl',                pmCodes: ['nhl'], pmTags: ['nhl'] },
+    { key: 'EPL',   espn: 'soccer/eng.1',              pmCodes: ['epl'], pmTags: ['epl', 'premier-league'] }
+  ];
+  var alive = false, emit = null, timer = null, meta = null, metaAt = 0, metaP = null;
+
+  /* ---------- network ---------- */
+  function viaProxy(url) {
+    var p = opts.proxy; if (!p) return url;
+    if (p.indexOf('{url}') >= 0) return p.replace('{url}', encodeURIComponent(url));
+    return /=$/.test(p) ? p + encodeURIComponent(url) : p + url;
+  }
+  async function getJSON(url) {
+    var ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var to = setTimeout(function () { if (ctl) ctl.abort(); }, 15000);
+    try {
+      var r = await fetch(viaProxy(url), ctl ? { signal: ctl.signal, cache: 'no-store' } : { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } finally { clearTimeout(to); }
+  }
+  function msgOf(e) {
+    var m = String(e && e.message || e || 'error').replace(/^TypeError: /, '');
+    return /failed to fetch|networkerror|load failed|aborted/i.test(m) ? 'blocked or offline' : m;
+  }
+  function etDate(offsetDays) {                                       // YYYYMMDD in US Eastern time (ESPN's schedule day)
+    return new Date(Date.now() + offsetDays * 864e5).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }).replace(/-/g, '');
+  }
+  function parseArr(v) {                                               // Polymarket sends arrays as JSON-encoded strings
+    if (Array.isArray(v)) return v;
+    if (typeof v === 'string') { try { var a = JSON.parse(v); if (Array.isArray(a)) return a; } catch (e) {} }
+    return [];
+  }
+  function tsOf(x) {
+    if (!x) return 0; if (typeof x === 'number') return x;
+    var s = String(x).trim().replace(' ', 'T'); if (/[+-]\d\d$/.test(s)) s += ':00';
+    var t = Date.parse(s); return isNaN(t) ? 0 : t;
+  }
+
+  /* ---------- ESPN ---------- */
+  function periodLabel(L, p) {
+    if (L.key === 'NHL') return p <= 3 ? 'P' + p : p === 4 ? 'OT' : 'SO';
+    if (L.key === 'NBA') return p <= 4 ? 'Q' + p : 'OT' + (p > 5 ? p - 4 : '');
+    return p <= 4 ? 'Q' + p : 'OT';
+  }
+  function clockOf(L, st, state) {
+    var ty = st.type || {}, nm = String(ty.name || ''), p = st.period || 0, dc = st.displayClock || '';
+    if (state === 'final') { var m = String(ty.shortDetail || ty.detail || '').match(/(\d*OT|SO)/i); return m ? 'FINAL/' + m[1].toUpperCase() : 'FINAL'; }
+    if (/HALFTIME/.test(nm)) return L.key === 'EPL' ? 'HT' : 'HALF';
+    if (L.key === 'EPL') return dc || String(ty.shortDetail || '');
+    if (/END_PERIOD|END_OF/.test(nm)) return 'END ' + periodLabel(L, p);
+    return (periodLabel(L, p) + ' ' + dc).trim();
+  }
+  function teamOf(c) {
+    var t = c.team || {}, nm = t.shortDisplayName || t.name || t.displayName || t.abbreviation || '?';
+    return { name: nm, abbr: String(t.abbreviation || nm.slice(0, 3)).toUpperCase(),
+             _n: [t.displayName, t.shortDisplayName, t.name, t.nickname], _ab: abbrCanon(t.abbreviation) };
+  }
+  var BASE_PER = { NFL: 4, NCAAF: 4, NBA: 4, NHL: 3, EPL: 2 };
+  function numArr(c) {                                                 // linescores -> numbers placed by period (holes = not played yet)
+    var out = [];
+    (c.linescores || []).forEach(function (x, i) {
+      var p = (x && x.period > 0 ? x.period : i + 1) - 1, v = parseFloat(x && (x.value != null ? x.value : x.displayValue));
+      out[p] = isNaN(v) ? null : v;
+    });
+    return out;
+  }
+  function catLabel(cat) {
+    var t = String((cat && (cat.name || cat.displayName)) || '') + ' ' + String((cat && cat.abbreviation) || '');
+    if (/pass/i.test(t)) return 'PASS'; if (/rush/i.test(t)) return 'RUSH'; if (/receiv|\brec/i.test(t)) return 'REC';
+    if (/point/i.test(t)) return 'PTS'; if (/reb/i.test(t)) return 'REB'; if (/assist/i.test(t)) return 'AST'; if (/goal/i.test(t)) return 'G';
+    return String((cat && (cat.abbreviation || cat.shortDisplayName || cat.name)) || '').toUpperCase().slice(0, 5);
+  }
+  function leaderLine(cat, ent) {
+    var a = ent && ent.athlete, nm = a && (a.shortName || a.displayName || a.fullName);
+    var v = String(ent && ent.displayValue != null ? ent.displayValue : (ent && ent.value != null ? ent.value : '')).replace(/^\d+\/\d+,?\s*/, '').trim();   // "25/36, 301 YDS, 2 TD" -> "301 YDS, 2 TD"
+    var y = v.split(/,\s*/).filter(function (x) { return /YDS/i.test(x); })[0]; if (y) v = y;                          // football: just the yards, so the line stays short
+    return nm && v ? { c: catLabel(cat), n: String(nm), v: v } : null;
+  }
+  function leadersOf(comp, c) {                                        // NBA/NHL: leaders sit on the competitor; college football: on the game, one entry per team
+    var out = [], tid = String((c.team && c.team.id) || c.id || '');
+    if (Array.isArray(c.leaders) && c.leaders.length) c.leaders.forEach(function (cat) { var l = leaderLine(cat, cat && cat.leaders && cat.leaders[0]); if (l) out.push(l); });
+    else if (Array.isArray(comp.leaders)) comp.leaders.forEach(function (cat) {
+      var ent = ((cat && cat.leaders) || []).filter(function (e) { return e && e.team && String(e.team.id) === tid; })[0], l = leaderLine(cat, ent); if (l) out.push(l);
+    });
+    return out.slice(0, 3);
+  }
+  function goalsOf(L, comp, hc) {                                      // hockey / soccer: who scored (only when ESPN lists the scoring plays)
+    if (L.key !== 'EPL' && L.key !== 'NHL') return [];
+    var hid = String((hc.team && hc.team.id) || hc.id || ''), out = [];
+    (comp.details || []).forEach(function (d) {
+      if (!d || !(d.scoringPlay === true || /^(goal|own goal|penalty - scored)/i.test(String(d.type && d.type.text || '')))) return;
+      var a = d.athletesInvolved && d.athletesInvolved[0], tid = String((d.team && d.team.id) || '');
+      out.push({ t: String((d.clock && d.clock.displayValue) || ''), n: String((a && (a.shortName || a.displayName)) || ''), side: tid && tid === hid ? 'home' : 'away' });
+    });
+    return out.slice(-4);
+  }
+  function boxOf(L, comp, hc, ac, st, state) {
+    var a = numArr(ac), h = numArr(hc), n = Math.max(BASE_PER[L.key] || 4, a.length, h.length), box = {
+      labels: periodNames(L.key, n), away: [], home: [], cur: state === 'live' ? Math.max(0, (st.period || 1) - 1) : -1,
+      leaders: { away: leadersOf(comp, ac), home: leadersOf(comp, hc) }, goals: goalsOf(L, comp, hc) };
+    for (var i = 0; i < n; i++) { box.away.push(a[i] == null ? null : a[i]); box.home.push(h[i] == null ? null : h[i]); }
+    return box;
+  }
+  function parseEspn(L, ev, now, prev) {
+    var comp = ev && ev.competitions && ev.competitions[0]; if (!comp) return null;
+    var st = ev.status || comp.status || {}, ty = st.type || {};
+    if (/POSTPONED|CANCEL|FORFEIT/i.test(String(ty.name || ''))) return null;
+    var hc = null, ac = null;
+    (comp.competitors || []).forEach(function (c) { if (c.homeAway === 'home') hc = c; else if (c.homeAway === 'away') ac = c; });
+    if (!hc || !ac) return null;
+    var state = ty.state === 'in' ? 'live' : ty.state === 'post' ? 'final' : 'pre';
+    var start = Date.parse(ev.date || comp.date) || 0;
+    if (state === 'final' && start && now - start > 9 * 3600e3) return null;           // yesterday's results
+    if (state === 'pre' && start && start - now > 72 * 3600e3) return null;
+    var rk = function (c) { return (c.curatedRank && c.curatedRank.current > 0 && c.curatedRank.current < 99) ? c.curatedRank.current : 99; };
+    var g = { id: 'espn:' + L.key + ':' + ev.id, league: L.key, state: state, startTime: start, home: teamOf(hc), away: teamOf(ac),
+              clock: clockOf(L, st, state), score: null, _rank: Math.min(rk(hc), rk(ac)) };
+    if (state !== 'pre') {
+      var sh = parseInt(hc.score, 10), sa = parseInt(ac.score, 10);
+      g.score = { home: isNaN(sh) ? 0 : sh, away: isNaN(sa) ? 0 : sa };
+      var pv = prev[g.id];
+      if (pv) { if (g.score.home > pv.home) g.lastScore = { side: 'home', at: now }; else if (g.score.away > pv.away) g.lastScore = { side: 'away', at: now }; }
+      try { g.box = boxOf(L, comp, hc, ac, st, state); g.boxSig = JSON.stringify(g.box); } catch (e) { g.box = null; g.boxSig = ''; }
+    }
+    return g;
+  }
+  async function pollEspn(L) {
+    var base = ESPN + L.espn + '/scoreboard?limit=300' + (L.extra || ''), data = null;
+    if (!L.noRange) {                                                  // yesterday..+2 days, so tomorrow's games are visible too
+      try { data = await getJSON(base + '&dates=' + etDate(-1) + '-' + etDate(2)); } catch (e) { data = null; }
+      if (data && !Array.isArray(data.events)) data = null;
+      if (data) L.rangeFail = 0;
+    }
+    if (!data) {
+      data = await getJSON(base);
+      if (!data || !Array.isArray(data.events)) throw new Error('unexpected ESPN response');
+      if (!L.noRange) { L.rangeFail = (L.rangeFail || 0) + 1; if (L.rangeFail >= 3) L.noRange = true; }
+    }
+    var now = Date.now(), prev = L.prev || {}, seen = {}, games = [];
+    data.events.forEach(function (ev) {
+      var g = parseEspn(L, ev, now, prev);
+      if (g) { games.push(g); if (g.score) seen[g.id] = { home: g.score.home, away: g.score.away }; }
+    });
+    L.prev = seen; L.games = games;
+  }
+
+  /* ---------- team-name matching (ESPN team <-> Polymarket text) ---------- */
+  var ALIAS = [
+    [/\bman(?:chester)? ?city\b/g, 'manchester city'], [/\bman(?:chester)? ?(?:utd|united)\b/g, 'manchester united'],
+    [/\bspurs\b/g, 'tottenham hotspur'], [/\btottenham(?! hotspur)\b/g, 'tottenham hotspur'], [/\bwolves\b/g, 'wolverhampton wanderers'],
+    [/\bnottm forest\b/g, 'nottingham forest'], [/\bbrighton (?:and )?hove albion\b/g, 'brighton'], [/\bnewcastle(?: united)?\b/g, 'newcastle united'],
+    [/\bwest ham(?: united)?\b/g, 'west ham united'], [/\bleeds(?: united)?\b/g, 'leeds united'], [/\bleicester(?: city)?\b/g, 'leicester city']
+  ];
+  var ABBR = { wsh: 'was', jac: 'jax', gs: 'gsw', sa: 'sas', no: 'nop', ny: 'nyk' };
+  function canon(s) {
+    s = String(s == null ? '' : s).toLowerCase();
+    if (s.normalize) s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    s = s.replace(/&/g, ' and ').replace(/[^a-z0-9 ]+/g, ' ').replace(/\b(fc|afc|cf|the)\b/g, ' ').replace(/\s+/g, ' ').trim();
+    ALIAS.forEach(function (a) { s = s.replace(a[0], a[1]); });
+    return s;
+  }
+  function abbrCanon(a) { a = String(a == null ? '' : a).toLowerCase().replace(/[^a-z0-9]/g, ''); return ABBR[a] || a; }
+  function single(team, s) {                                           // 0..1: how well does text `s` name this ESPN team?
+    var n = canon(s), best = 0; if (!n) return 0;
+    team._n.forEach(function (c) {
+      var cc = canon(c); if (!cc) return;
+      if (cc === n) { best = Math.max(best, 1); return; }
+      var a = cc.split(' '), b = n.split(' ');
+      var aInB = a.every(function (w) { return b.indexOf(w) >= 0; }), bInA = b.every(function (w) { return a.indexOf(w) >= 0; });
+      if (aInB) best = Math.max(best, 0.95 - 0.15 * (b.length - a.length));
+      else if (bInA) best = Math.max(best, 0.95 - 0.15 * (a.length - b.length));
+    });
+    if (team._ab && /^[a-z0-9]{2,5}$/i.test(String(s).trim()) && abbrCanon(s) === team._ab) best = Math.max(best, 0.85);
+    return best;
+  }
+  function tm(team, names) { var b = 0; names.forEach(function (x) { b = Math.max(b, single(team, x)); }); return b; }
+  function pairScore(g, p0, p1) {                                      // both teams must match (either way round)
+    var a = tm(g.home, p0), b = tm(g.away, p1), c = tm(g.home, p1), d = tm(g.away, p0);
+    return Math.max((a >= 0.75 && b >= 0.75) ? a + b : 0, (c >= 0.75 && d >= 0.75) ? c + d : 0);
+  }
+  function sideOf(g, name) {
+    var h = single(g.home, name), a = single(g.away, name);
+    return (h >= 0.75 && h > a) ? 'home' : (a >= 0.75 && a > h) ? 'away' : null;
+  }
+
+  /* ---------- Polymarket ---------- */
+  function buildPm(events) {                                           // group "<slug>" and "<slug>-more-markets" into one game
+    var by = {}, list = [];
+    events.forEach(function (ev) {
+      var slug = String(ev && ev.slug || ''), m = slug.match(/^(.+?)-(\d{4}-\d{2}-\d{2})/); if (!m) return;
+      var key = m[0], o = by[key], base = slug === key;
+      if (!o) { o = by[key] = { key: key, date: m[2], parts: m[1].split('-'), title: '', teams: null, start: 0, mkts: [] }; list.push(o); }
+      if (base || !o.title) o.title = String(ev.title || o.title || '');
+      if ((base || !o.teams) && Array.isArray(ev.teams) && ev.teams.length >= 2) o.teams = ev.teams;
+      var st = tsOf(ev.startTime) || tsOf(ev.gameStartTime) || (ev.markets && ev.markets[0] && tsOf(ev.markets[0].gameStartTime));
+      if (st && (base || !o.start)) o.start = st;
+      (ev.markets || []).forEach(function (mk) { o.mkts.push(mk); });
+    });
+    return list;
+  }
+  function pmPairs(pm) {                                               // every way we can learn the two team names of an event
+    if (pm._pairs) return pm._pairs;
+    var pairs = [], nm = function (t) { return typeof t === 'string' ? [t] : [t && t.name, t && t.abbreviation, t && t.alias, t && t.shortName]; };
+    if (pm.teams) pairs.push([nm(pm.teams[0]), nm(pm.teams[1])]);
+    var t = pm.title.replace(/\s+[-–—|]\s+.*$/, '').split(/\s+(?:vs\.?|v|@|at)\s+/i);
+    if (t.length === 2) pairs.push([[t[0]], [t[1]]]);
+    var names = [];
+    pm.mkts.forEach(function (mk) {
+      if (!mk || String(mk.sportsMarketType || '').toLowerCase() !== 'moneyline') return;
+      var o = parseArr(mk.outcomes).map(String);
+      if (o.length === 2 && !/^yes$/i.test(o[0])) pairs.push([[o[0]], [o[1]]]);
+      else if (mk.groupItemTitle && !/draw|tie/i.test(mk.groupItemTitle)) names.push(String(mk.groupItemTitle));
+    });
+    if (names.length === 2) pairs.push([[names[0]], [names[1]]]);
+    if (pm.parts.length >= 3) pairs.push([[pm.parts[1]], [pm.parts[2]]]);
+    return (pm._pairs = pairs);
+  }
+  function timeOk(g, pm) {
+    if (pm.start && g.startTime) return Math.abs(pm.start - g.startTime) <= 30 * 3600e3;
+    var d = Date.parse(pm.date + 'T12:00:00Z'); return !g.startTime || isNaN(d) || Math.abs(d - g.startTime) <= 2 * 864e5;
+  }
+  function matchPm(g, list) {
+    var best = null, bs = 0;
+    list.forEach(function (pm) {
+      if (!timeOk(g, pm)) return;
+      var s = 0; pmPairs(pm).forEach(function (pr) { s = Math.max(s, pairScore(g, pr[0], pr[1])); });
+      if (s > bs) { bs = s; best = pm; }
+    });
+    return bs >= 1.5 ? best : null;
+  }
+  function settled(p) { return p >= 0.995 || p <= 0.005; }
+  function oddsFrom(g, pm) {                                           // -> probabilities from the home team's point of view
+    var res = { ml: null, spread: null, total: null }, bestS = 9, bestT = 9, yes = {};
+    pm.mkts.forEach(function (mk) {
+      if (!mk || mk.closed === true || mk.active === false) return;
+      var outs = parseArr(mk.outcomes).map(String), pr = parseArr(mk.outcomePrices).map(Number);
+      if (outs.length < 2 || pr.length < outs.length || pr.some(isNaN)) return;
+      var q = String(mk.question || ''), type = String(mk.sportsMarketType || '').toLowerCase();
+      var yn = /^yes$/i.test(outs[0]) && /^no$/i.test(outs[1]), ou = /^over$/i.test(outs[0]) && /^under$/i.test(outs[1]);
+      if (!type && !yn) type = /spread/i.test(q) ? 'spreads' : (ou || /o\/u|total/i.test(q)) ? 'totals' : /half|quarter|period|1st|2nd/i.test(q) ? 'other' : 'moneyline';
+      var tt = pr[0] + pr[1];
+      if (type === 'moneyline') {
+        if (yn) {                                                      // football (soccer) style: one Yes/No market per result
+          var who = String(mk.groupItemTitle || '') || q.replace(/^will\s+/i, '').replace(/\s+win\b.*$/i, '');
+          if (/draw|tie/i.test(who)) return;
+          var sd = sideOf(g, who); if (sd) yes[sd] = pr[0];
+        } else if (!res.ml && tt > 0 && !settled(pr[0]) && !settled(pr[1])) {
+          var a0 = sideOf(g, outs[0]), a1 = sideOf(g, outs[1]);
+          if (a0 && a1 && a0 !== a1) { res.ml = {}; res.ml[a0] = pr[0] / tt; res.ml[a1] = pr[1] / tt; }
+        }
+      } else if (type === 'totals' && ou && tt > 0 && !settled(pr[0]) && !settled(pr[1])) {
+        var ln = mk.line == null ? NaN : Number(mk.line);
+        if (isNaN(ln)) { var m2 = q.match(/(?:o\/u|over\/under|total)[^\d]{0,12}(\d+(?:\.\d+)?)/i); ln = m2 ? +m2[1] : NaN; }
+        var po = pr[0] / tt;
+        if (!isNaN(ln) && Math.abs(po - 0.5) < bestT) { bestT = Math.abs(po - 0.5); res.total = { line: ln, over: po, under: 1 - po }; }
+      } else if (type === 'spreads' && !yn && tt > 0 && !settled(pr[0]) && !settled(pr[1])) {
+        var s0 = sideOf(g, outs[0]), s1 = sideOf(g, outs[1]);
+        if (!s0 || !s1 || s0 === s1) return;
+        var mm = q.match(/^(?:spread:?\s*)?(.+?)\s*\(([+-]?\d+(?:\.\d+)?)\)/i), ln2 = NaN, own = null;
+        if (mm) { own = sideOf(g, mm[1]); ln2 = +mm[2]; }
+        if (!own) { ln2 = mk.line == null ? NaN : Number(mk.line); own = s0; }       // otherwise assume the line belongs to the first outcome
+        if (isNaN(ln2)) return;
+        var ph = s0 === 'home' ? pr[0] / tt : pr[1] / tt;
+        if (Math.abs(ph - 0.5) < bestS) { bestS = Math.abs(ph - 0.5); res.spread = { line: own === 'home' ? ln2 : -ln2, home: ph, away: 1 - ph }; }
+      }
+    });
+    if (!res.ml && yes.home != null && yes.away != null && !settled(yes.home) && !settled(yes.away)) res.ml = { home: yes.home, away: yes.away };
+    return res;
+  }
+  function loadMeta() {                                                // /sports lists each league's tag + series ids
+    if (!metaP) metaP = getJSON(GAMMA + 'sports').then(function (arr) {
+      var m = {}; (Array.isArray(arr) ? arr : []).forEach(function (s) { if (s && s.sport) m[String(s.sport).toLowerCase()] = s; });
+      meta = m; metaAt = Date.now();
+    }, function () { meta = {}; metaAt = Date.now(); }).then(function () { metaP = null; });
+    return metaP;
+  }
+  function pmUrls(L) {
+    var urls = [];
+    L.pmCodes.forEach(function (code) {
+      var s = meta && meta[code];
+      if (s && s.series) {
+        var sr = encodeURIComponent(String(s.series));
+        urls.push(GAMMA + 'events?series_id=' + sr + '&tag_id=100639&closed=false&limit=100&order=startTime&ascending=true');
+        urls.push(GAMMA + 'events?series_id=' + sr + '&tag_id=100639&closed=false&limit=100');
+      }
+    });
+    L.pmTags.forEach(function (t) { urls.push(GAMMA + 'events?tag_slug=' + t + '&closed=false&active=true&limit=100'); });
+    return urls;
+  }
+  async function pollPm(L) {
+    if (meta == null || (!Object.keys(meta).length && Date.now() - metaAt > 300000)) await loadMeta();
+    var urls = pmUrls(L), order = [], lastErr = null, ok = false;
+    if (L.pmGood != null && urls[L.pmGood]) order.push(L.pmGood);
+    urls.forEach(function (u, i) { if (i !== L.pmGood) order.push(i); });
+    for (var k = 0; k < order.length; k++) {
+      try {
+        var data = await getJSON(urls[order[k]]);
+        var arr = Array.isArray(data) ? data : (data && Array.isArray(data.events) ? data.events : (data && Array.isArray(data.data) ? data.data : null));
+        if (!arr) throw new Error('unexpected Polymarket response');
+        ok = true;
+        var pm = buildPm(arr);
+        if (pm.length) { L.pmGood = order[k]; L.pm = pm; return; }
+      } catch (e) { lastErr = e; }
+    }
+    if (ok) { L.pm = []; L.pmGood = null; return; }
+    throw lastErr || new Error('no Polymarket data');
+  }
+
+  /* ---------- Polymarket player props ----------
+     Each prop is its own market, e.g. "Nikola Jokić: Points O/U 26.5" (several alternate lines per player) or
+     "Bijan Robinson: Anytime Touchdown". Outcomes are Yes/No or Over/Under; Yes and Over are the same side.
+     They carry no team, so a prop is tied to a game by the game-event slug in its `events[0]`. */
+  var STAT_ABBR = [[/points?\b/i, 'PTS'], [/rebounds?/i, 'REB'], [/assists?/i, 'AST'], [/three|3-?pt|3-pointers?/i, '3PM'], [/steals?/i, 'STL'], [/blocks?/i, 'BLK'],
+                   [/passing yards?/i, 'PASS YDS'], [/rushing yards?/i, 'RUSH YDS'], [/receiving yards?/i, 'REC YDS'], [/passing (td|touchdowns?)/i, 'PASS TD'],
+                   [/receptions?/i, 'REC'], [/anytime/i, 'ANY TD']];
+  var STAT_ORDER = ['PTS', 'PASS YDS', 'REB', 'RUSH YDS', 'AST', 'REC YDS', 'ANY TD', '3PM', 'REC', 'PASS TD'];
+  function statLabel(t) { for (var i = 0; i < STAT_ABBR.length; i++) if (STAT_ABBR[i][0].test(t)) return STAT_ABBR[i][1]; return String(t).toUpperCase().slice(0, 12); }
+  function parseProp(mk) {
+    if (!mk || mk.closed === true || mk.active === false) return null;
+    if (/^(moneyline|spreads?|totals?|both_teams_to_score|btts)$/.test(String(mk.sportsMarketType || '').toLowerCase())) return null;
+    var m = String(mk.question || mk.groupItemTitle || '').match(/^(.+?):\s*(.+)$/); if (!m) return null;
+    var name = m[1].trim(), rest = m[2].trim(); if (/\bvs\.?\b|\s@\s/i.test(name)) return null;      // "Nuggets vs. Pacers: ..." is a game market
+    var ou = rest.match(/^(.+?)\s+O\/U\s+(\d+(?:\.\d+)?)\s*$/i), kind, stat, line = null;
+    if (ou) { kind = 'ou'; stat = statLabel(ou[1]); line = parseFloat(ou[2]); }
+    else if (/anytime|first (touchdown|td|goal)/i.test(rest)) { kind = 'yn'; stat = statLabel(rest); }
+    else return null;
+    var outs = parseArr(mk.outcomes).map(String), pr = parseArr(mk.outcomePrices).map(Number), oi = -1;
+    if (outs.length !== 2 || pr.length < 2 || pr.some(isNaN)) return null;
+    outs.forEach(function (o, i) { if (/^(over|yes)$/i.test(o)) oi = i; });
+    var tt = pr[0] + pr[1]; if (oi < 0 || !(tt > 0)) return null;
+    var pv = pr[oi] / tt; if (settled(pv)) return null;
+    var bid = mk.bestBid == null ? NaN : Number(mk.bestBid), ask = mk.bestAsk == null ? NaN : Number(mk.bestAsk);
+    var thin = (mk.bestBid != null || mk.bestAsk != null) && !(bid > 0 && ask > 0 && ask - bid <= 0.12);        // wide or one-sided book: the mid price is not trustworthy
+    return { id: String(mk.id || mk.slug || name + stat + line), name: name, stat: stat, line: line, kind: kind, p: pv, thin: thin, vol: Number(mk.volumeNum || mk.volume || 0) || 0 };
+  }
+  function pickProps(list) {                                           // one line per player+stat (the most balanced), then a varied top 12
+    var best = {}, groups = {}, order = [], seen = {}, out = [];
+    list.forEach(function (x) {
+      if (seen[x.id]) return; seen[x.id] = 1;
+      var k = x.name + '|' + x.stat, b = best[k], xt = x.thin ? 1 : 0, bt = b && b.thin ? 1 : 0;
+      if (!b || xt < bt || (xt === bt && Math.abs(x.p - 0.5) < Math.abs(b.p - 0.5))) best[k] = x;
+    });
+    Object.keys(best).forEach(function (k) { var x = best[k]; if (!groups[x.stat]) { groups[x.stat] = []; order.push(x.stat); } groups[x.stat].push(x); });
+    order.sort(function (a, b) { var i = STAT_ORDER.indexOf(a), j = STAT_ORDER.indexOf(b); return (i < 0 ? 99 : i) - (j < 0 ? 99 : j); });
+    order.forEach(function (st) { groups[st].sort(function (a, b) { return ((a.thin ? 1 : 0) - (b.thin ? 1 : 0)) || (b.vol - a.vol) || ((b.line || 0) - (a.line || 0)); }); });
+    for (var r = 0; out.length < 12; r++) {                            // round-robin over the stats so one stat does not fill the card
+      var added = false;
+      order.forEach(function (st) { if (groups[st][r] && out.length < 12) { var x = groups[st][r]; out.push({ name: x.name, stat: x.stat, line: x.line, kind: x.kind, p: x.p, thin: x.thin }); added = true; } });
+      if (!added) break;
+    }
+    return out;
+  }
+  async function pollProps(L) {
+    var iso = function (ms) { return encodeURIComponent(new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z')); };
+    var types = L.propTypes.map(function (t) { return 'sports_market_types=' + t; }).join('&'), now = Date.now();
+    var variants = [GAMMA + 'markets?' + types + '&closed=false&active=true&end_date_min=' + iso(now - 8 * 3600e3) + '&end_date_max=' + iso(now + 40 * 3600e3),
+                    GAMMA + 'markets?' + types + '&closed=false&active=true'];                                       // fallback: no date window
+    var order = []; if (L.prGood != null) order.push(L.prGood); variants.forEach(function (u, i) { if (i !== L.prGood) order.push(i); });
+    var lastErr = null;
+    for (var k = 0; k < order.length; k++) {
+      try {
+        var all = [], first = 0;
+        for (var page = 0; page < 4; page++) {
+          var data = await getJSON(variants[order[k]] + '&limit=500&offset=' + all.length);
+          var arr = Array.isArray(data) ? data : (data && Array.isArray(data.data) ? data.data : null);
+          if (!arr) throw new Error('unexpected Polymarket response');
+          if (!page) first = arr.length;
+          all = all.concat(arr);
+          if (!arr.length || arr.length < first) break;                  // a short page is the last page
+        }
+        var by = {};
+        all.forEach(function (mk) {
+          var ev = mk && mk.events && mk.events[0], m = String((ev && ev.slug) || (mk && mk.eventSlug) || '').match(/^(.+?-\d{4}-\d{2}-\d{2})/), pr = m && parseProp(mk);
+          if (pr) (by[m[1]] = by[m[1]] || []).push(pr);
+        });
+        L.prGood = order[k]; L.propsBy = by; return;
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('no Polymarket prop data');
+  }
+  function propsOf(L, pm) {                                            // companion "-player-props" market feed + any props that already sit inside the game event
+    if (!pm._props) pm._props = pm.mkts.map(parseProp).filter(Boolean);
+    return pickProps(((L.propsBy && L.propsBy[pm.key]) || []).concat(pm._props));
+  }
+
+  /* ---------- merge + schedule ---------- */
+  var wantP = function () { return !!(opts.wantProps && opts.wantProps()); };
+  function rematch(L) {
+    var list = L.pm || [], out = [], wp = wantP();
+    (L.games || []).forEach(function (g) {
+      var e = Object.assign({}, g), tag = 'ESPN';
+      e.ml = {}; e.spread = {}; e.total = {};
+      if (g.state !== 'final' && list.length) {
+        var pm = matchPm(g, list);
+        if (pm && wp) {
+          e.props = propsOf(L, pm);
+          e.propsSig = e.props.map(function (x) { return x.name + x.line + Math.round(x.p * 100) + (x.thin ? 't' : ''); }).join(',');
+        }
+        if (pm) {
+          var od = oddsFrom(g, pm);
+          if (od.ml) e.ml = { home: toAmerican(od.ml.home), away: toAmerican(od.ml.away) };
+          if (od.spread) e.spread = { line: od.spread.line, home: toAmerican(od.spread.home), away: toAmerican(od.spread.away) };
+          if (od.total) e.total = { line: od.total.line, over: toAmerican(od.total.over), under: toAmerican(od.total.under) };
+          if (od.ml || od.spread || od.total) tag = 'ESPN · POLYMARKET ODDS';
+        }
+      }
+      e.tag = tag; out.push(e);
+    });
+    L.out = out;
+  }
+  function capped(list) {                                              // keep the ticker readable on a 60-game Saturday
+    var live = [], pre = [], fin = [];
+    list.forEach(function (e) { (e.state === 'live' ? live : e.state === 'pre' ? pre : fin).push(e); });
+    var byRank = function (a, b) { return ((a._rank || 99) - (b._rank || 99)) || (a.startTime - b.startTime); };
+    live.sort(byRank); pre.sort(byRank); fin.sort(function (a, b) { return b.startTime - a.startTime; });
+    return live.slice(0, 10).concat(pre.slice(0, 10), fin.slice(0, 6));
+  }
+  function publish() {
+    var okN = LG.filter(function (L) { return L.eOk; }).length, doneN = LG.filter(function (L) { return L.eDone; }).length;
+    var lists = LG.map(function (L) { return capped(L.out || []); }), out = [], i = 0, more = true;
+    while (more) { more = false; lists.forEach(function (l) { if (i < l.length) { out.push(l[i]); more = true; } }); i++; }
+    var eErr = (LG.filter(function (L) { return L.eErr; })[0] || {}).eErr || '';
+    if (!okN) { if (doneN === LG.length && opts.onStatus) opts.onStatus({ phase: 'down', error: eErr || 'no response', at: Date.now() }); return; }
+    var pmBad = LG.filter(function (L) { return L.pErr && !(L.pm && L.pm.length); });
+    var prBad = LG.filter(function (L) { return L.prErr && !L.propsBy; });
+    var st = { phase: 'ok', games: out.length, odds: out.filter(hasOdds).length, espnOk: okN, espnTotal: LG.length, error: eErr,
+               props: out.filter(function (e) { return e.props && e.props.length; }).length, propsError: prBad.length ? prBad[0].prErr : '',
+               pmEvents: LG.reduce(function (n, L) { return n + (L.pm ? L.pm.length : 0); }, 0), pmError: pmBad.length ? pmBad[0].pErr : '', at: Date.now() };
+    emit(out);
+    if (opts.onStatus) opts.onStatus(st);
+  }
+  var backoff = function (n) { return Math.min(180000, 15000 * Math.pow(2, n)); };
+  var anyLive = function (L) { return (L.games || []).some(function (g) { return g.state === 'live'; }); };
+  var relevant = function (L, now) { return (L.games || []).some(function (g) { return g.state === 'live' || (g.state === 'pre' && g.startTime - now < 36 * 3600e3); }); };
+  async function runEspn(L) {
+    L.eBusy = true;
+    try { await pollEspn(L); L.eFail = 0; L.eErr = ''; L.eOk = Date.now(); L.eNext = Date.now() + (anyLive(L) ? 15000 : 60000); }
+    catch (e) { L.eFail = (L.eFail || 0) + 1; L.eErr = msgOf(e); L.eNext = Date.now() + backoff(L.eFail); }
+    L.eBusy = false; L.eDone = true;
+    if (alive) { rematch(L); publish(); tick(); }                     // tick(): start this league's Polymarket poll right away
+  }
+  async function runProps(L) {
+    L.prBusy = true;
+    try { await pollProps(L); L.prFail = 0; L.prErr = ''; L.prNext = Date.now() + (anyLive(L) ? 90000 : 240000); }       // props move slowly and the payload is big (hundreds of markets)
+    catch (e) { L.prFail = (L.prFail || 0) + 1; L.prErr = msgOf(e); L.prNext = Date.now() + backoff(L.prFail); }
+    L.prBusy = false;
+    if (alive) { rematch(L); publish(); }
+  }
+  async function runPm(L) {
+    L.pBusy = true;
+    try { await pollPm(L); L.pFail = 0; L.pErr = ''; L.pNext = Date.now() + (anyLive(L) ? 30000 : (L.pm && L.pm.length ? 90000 : 150000)); }
+    catch (e) { L.pFail = (L.pFail || 0) + 1; L.pErr = msgOf(e); L.pNext = Date.now() + backoff(L.pFail); }
+    L.pBusy = false;
+    if (alive) { rematch(L); publish(); }
+  }
+  function tick() {
+    if (!alive) return;
+    var now = Date.now();
+    LG.forEach(function (L) {
+      if (!L.eBusy && now >= (L.eNext || 0)) runEspn(L);
+      if (!L.pBusy && L.games && now >= (L.pNext || 0)) {
+        if (relevant(L, now)) runPm(L);
+        else { L.pNext = now + 30000; if (L.pm && L.pm.length) { L.pm = []; rematch(L); publish(); } }
+      }
+      if (L.propTypes && wantP() && !L.prBusy && L.games && now >= (L.prNext || 0)) {      // player props: only fetched while the Props row is switched on
+        if (relevant(L, now)) runProps(L); else L.prNext = now + 30000;
+      }
+    });
+  }
+  function pokeProps() {                                               // the Props row was switched on/off: refresh now
+    LG.forEach(function (L) { L.prNext = 0; if (L.games) rematch(L); });
+    if (alive) { publish(); tick(); }
+  }
+  return {
+    isSimulated: false,
+    start: function (e) { emit = e; alive = true; tick(); timer = setInterval(tick, 3000); },
+    stop: function () { alive = false; clearInterval(timer); },
+    pokeProps: pokeProps,
+    debug: function () { return LG.map(function (L) { return { league: L.key, games: (L.games || []).length, pmEvents: (L.pm || []).length, withOdds: (L.out || []).filter(hasOdds).length, espnError: L.eErr || '', pmError: L.pErr || '', pmVariant: L.pmGood, propGames: (L.out || []).filter(function (e) { return e.props && e.props.length; }).length, propError: L.prErr || '' }; }); },
+    _t: { parseProp: parseProp, pickProps: pickProps, boxOf: boxOf, canon: canon, single: single, buildPm: buildPm, matchPm: matchPm, oddsFrom: oddsFrom, parseEspn: parseEspn, clockOf: clockOf, teamOf: teamOf, rematch: rematch, LG: LG }
+  };
+}
+
+/* ======================================================================
+   TICKER STORE  (merges feed updates, tracks price flashes, history, movers)
+   ====================================================================== */
+var store = new Map();
+var rows = [
+  { key: 'live',  title: 'Live',  list: [], meshes: [], group: null, geom: null },
+  { key: 'lines', title: 'Lines', list: [], meshes: [], group: null, geom: null },
+  { key: 'moves', title: 'Moves', list: [], meshes: [], group: null, geom: null },
+  { key: 'box',   title: 'Box score', list: [], meshes: [], group: null, geom: null, optIn: true },     // shares rows[0]'s list, so each card sits right above its game
+  { key: 'props', title: 'Props', list: [], meshes: [], group: null, geom: null, optIn: true }
+];
+var ROW_ORDER = ['live', 'box', 'lines', 'moves', 'props'];          // bottom -> top
+var rowByKey = {}; rows.forEach(function (r) { rowByKey[r.key] = r; });
+function sigOf(e) {
+  var s = e.score || {}, m = e.ml || {}, sp = e.spread || {}, t = e.total || {};
+  return [e.state, e.clock, s.home, s.away, m.home, m.away, sp.line, sp.home, sp.away, t.line, t.over, t.under].join('|');
+}
+function ingest(list) {
+  var now = Date.now(), seen = new Set();
+  list.forEach(function (e) {
+    if (!e || e.id == null) return;
+    seen.add(e.id);
+    if (LEAGUE_ORDER.indexOf(e.league) < 0) { LEAGUE_ORDER.push(e.league); uiStale = true; }
+    e.ml = e.ml || {}; e.spread = e.spread || {}; e.total = e.total || {};
+    var t = store.get(e.id), pNow = pHomeOf(e.ml);
+    if (!t) {
+      t = Object.assign({}, e, { version: 1, flash: { home: 0, away: 0, at: 0 }, hist: [], sig: sigOf(e), _hot: 0, bver: 1, pver: 1, bsig: e.boxSig || '', psig: e.propsSig || '' });
+      t.open = e.open || { pHome: pNow, ml: { home: e.ml.home, away: e.ml.away } };
+      t.fb = { home: qOf(e.ml.home), away: qOf(e.ml.away) };            // price level at the last flash
+      store.set(e.id, t);
+    } else {
+      // flash a side when its implied probability has moved by at least 1 point since the last flash
+      var changed = false, qh1 = qOf(e.ml.home), qa1 = qOf(e.ml.away);
+      if (qh1 != null && t.fb.home != null && Math.abs(qh1 - t.fb.home) >= 0.01) { t.flash.home = qh1 > t.fb.home ? 1 : -1; t.fb.home = qh1; changed = true; }
+      if (qa1 != null && t.fb.away != null && Math.abs(qa1 - t.fb.away) >= 0.01) { t.flash.away = qa1 > t.fb.away ? 1 : -1; t.fb.away = qa1; changed = true; }
+      if (t.fb.home == null) t.fb.home = qh1;
+      if (t.fb.away == null) t.fb.away = qa1;
+      if (changed) t.flash.at = now;
+      var keep = { open: t.open, flash: t.flash, hist: t.hist, version: t.version, sig: t.sig, _hot: t._hot, fb: t.fb, bver: t.bver, pver: t.pver, bsig: t.bsig, psig: t.psig };
+      Object.assign(t, e, keep);
+      if ((e.boxSig || '') !== t.bsig) { t.bsig = e.boxSig || ''; t.bver++; }                  // box score / props have their own counters, so only their rows redraw
+      if ((e.propsSig || '') !== t.psig) { t.psig = e.propsSig || ''; t.pver++; }
+      if (t.open.pHome == null && pNow != null) t.open = { pHome: pNow, ml: { home: e.ml.home, away: e.ml.away } };    // prices that arrive after the game was first seen
+      var s = sigOf(t); if (s !== t.sig) { t.sig = s; t.version++; }
+    }
+    if (pNow != null) { t.hist.push(pNow); if (t.hist.length > 90) t.hist.shift(); }
+  });
+  store.forEach(function (_, id) { if (!seen.has(id)) store.delete(id); });
+  rebuildLists();
+}
+function moveInfo(t) {
+  var pNow = pHomeOf(t.ml), pOpen = t.open && t.open.pHome;
+  if (pNow == null || pOpen == null) return null;
+  var d = (pNow - pOpen) * 100;
+  return { d: d, side: d >= 0 ? 'home' : 'away', pp: Math.abs(d) };
+}
+function refreshMovers() {
+  var all = Array.from(store.values()).filter(function (t) { return leagueOn(t.league) && hasOdds(t); });
+  var pre = all.filter(function (t) { return t.state === 'pre'; });
+  var pool = pre.length >= 4 ? pre : all;
+  pool.sort(function (a, b) { var x = moveInfo(a), y = moveInfo(b); return (y ? y.pp : 0) - (x ? x.pp : 0); });
+  rows[2].list = pool.slice(0, 10);
+}
+function rebuildLists() {
+  var all = Array.from(store.values()).filter(showable);
+  rows[0].list = all.filter(function (t) { return t.state !== 'pre'; });
+  rows[1].list = all.filter(function (t) { return t.state === 'pre'; });
+  rowByKey.box.list = rows[0].list;                                    // same array as the Live row: same length, same slot maths, so the cards line up exactly
+  var pf = CFG.propsFor;                                               // props are self-describing cards, so only games that have some are listed
+  rowByKey.props.list = all.filter(function (t) {
+    return t.props && t.props.length && (pf === 'all' || (pf === 'live' ? t.state === 'live' : t.state === 'pre'));
+  }).sort(function (a, b) { return (a.state === 'live' ? 0 : 1) - (b.state === 'live' ? 0 : 1) || a.startTime - b.startTime; });
+  if (!rows[2].list.length) refreshMovers();
+}
+setInterval(function () {                                    // expire highlights
+  var now = Date.now();
+  store.forEach(function (t) {
+    if (t.flash.at && now - t.flash.at > FLASH_MS) { t.flash.at = 0; t.version++; }
+    var hot = t.lastScore && now - t.lastScore.at < SCORE_MS;
+    if (hot) t._hot = 1; else if (t._hot) { t._hot = 0; t.version++; }
+  });
+}, 500);
+setInterval(refreshMovers, 6000);
+
+/* ======================================================================
+   TEAM LOGOS  -  github.com/klunn91/team-logos (MIT), fetched at runtime; nothing is embedded in this file.
+   Each ticker league maps to a folder in that repo and each team to a file in it. Teams with no file
+   (every NHL team, and anything newer than the repo) get an initials badge instead.
+   Logos go on a light disc so dark marks stay readable on the dark cards.
+   To host your own copy (same folder layout), open the page with ?logos=./team-logos/  (or ?logos=off).
+   ====================================================================== */
+var LOGO_BASES = ['https://raw.githubusercontent.com/klunn91/team-logos/master/', 'https://cdn.jsdelivr.net/gh/klunn91/team-logos@master/'];
+var LOGO_DIR = { NFL: 'NFL', NBA: 'NBA', NCAAF: 'NCAA', EPL: 'Premier_League' };               // ticker league -> folder
+var LOGO_FILES = {                                                                           // every usable file in each folder
+  NFL: '49ers bears bengals bills broncos browns buccaneers cardinals chargers chiefs colts cowboys dolphins eagles falcons '
+    + 'giants jaguars jets lions packers panthers patriots raiders rams ravens saints seahawks steelers texans titans vikings',
+  NBA: '76ers bucks bulls cavaliers celtics clippers grizzlies hawks heat hornets jazz kings knicks lakers magic mavericks '
+    + 'nets nuggets pacers pelicans pistons raptors rockets spurs suns thunder timberwolves trailBlazers warriors wizards',
+  NCAAF: 'LouisianaTech OklahomaState TCU abileneChristian airForce akron alabama alabamaAM alabamaState albany alcornState '
+    + 'appalachianState arizona arizonaState arkansas arkansasPineBluff arkansasState army auburn austinPeay ballState baylor '
+    + 'bethuneCookman boiseState boston bowlingGreen brown bryant bucknell buffalo butler byu calPoly california campbell '
+    + 'centralArkansas centralConnecticut centralMichigan charlestonSouthern charlotte chattanooga cincinnati citadel clemson '
+    + 'coastalCarolina colgate colorado coloradoState columbia connecticut cornell dartmouth davidson dayton delaware '
+    + 'delawareState drake duke duquesne eastCarolina eastTennessee easternIllinois easternKentucky easternMichigan '
+    + 'easternWashington elon florida floridaAM floridaAtlantic floridaIntl floridaState fordham fresnoState furman '
+    + 'gardnerWebb georgetown georgia georgiaSouthern georgiaState georgiaTech gramblingState hampton harvard hawaii '
+    + 'holyCross houston houstonBaptist howard idaho idahoState illinois illinoisState incarnateWord indiana indianaState '
+    + 'iowa iowaState jacksonState jacksonville jacksonvilleState jamesMadison kansas kansasState kennesawState kentState '
+    + 'kentucky lafayette lamar lehigh liberty louisianaLafayette louisianaMonroe louisville lsu maine marist marshall '
+    + 'maryland massachusetts mcNeeseState memphis mercer miami miamiOH michigan michiganState middleTennessee minnesota '
+    + 'mississippiState mississippiValleyState missouri missouriState monmouth montana montanaState moreheadState morganState '
+    + 'murrayState navy ncState nebraska nevada newHampshire newMexico newMexicoState nichollsState norfolkState '
+    + 'northCarolina northCarolinaAT northCarolinaCentral northDakota northDakotaState northTexas northernArizona '
+    + 'northernColorado northernIllinois northernIowa northwestern northwesternState notreDame ohio ohioState oklahoma '
+    + 'oldDominion oleMiss oregon oregonState penn pennState pittsburgh portlandState prairieView presbyterianCollege '
+    + 'princeton purdue rhodeIsland rice richmond robertMorris rutgers sacramentoState sacredHeart samHoustonState samford '
+    + 'sanDiego sanDiegoState sanJoseState savannahState smu southAlabama southCarolina southCarolinaState southDakota '
+    + 'southDakotaState southFlorida southeastMissouriState southeasternLouisiana southern southernIllinois '
+    + 'southernMississippi southernUtah stFrancisPA stanford stephenFAustin stetson stonyBrook syracuse temple tennessee '
+    + 'tennesseeMartin tennesseeState tennesseeTech texas texasAM texasSanAntonio texasSouthern texasState texasTech toledo '
+    + 'towson troy tulane tulsa uab ucDavis ucf ucla unlv usc utah utahState utep valparaiso vanderbilt villanova virginia '
+    + 'virginiaTech vmi wagner wakeForest washington washingtonState weberState westVirginia westernCarolina westernIllinois '
+    + 'westernKentucky westernMichigan williamMary wisconsin wofford wyoming yale youngstownState',
+  EPL: 'arsenal astonVilla bournemouth brighton burnley cardiffCity chelsea crystalPalace everton fulham huddersfield '
+    + 'leicesterCity liverpool manchesterCity manchesterUnited newcastleUnited norwichCity southampton stokeCity '
+    + 'sunderlandAfc swanseaCityAfc tottenhamHotspur watford westBromwichAlbion westHamUnited wolves'
+};
+// other names a feed may use for the same team (keys are letters+digits only, lower case)
+var LOGO_ALIAS = {
+  NBA: { wolves: 'timberwolves', blazers: 'trailblazers', sixers: '76ers' },
+  EPL: { afcbournemouth: 'bournemouth', brightonhovealbion: 'brighton', brightonandhovealbion: 'brighton', mancity: 'manchestercity', manutd: 'manchesterunited',
+         manunited: 'manchesterunited', newcastle: 'newcastleunited', tottenham: 'tottenhamhotspur', spurs: 'tottenhamhotspur', westham: 'westhamunited',
+         wolverhamptonwanderers: 'wolves', sunderland: 'sunderlandafc', leicester: 'leicestercity', norwich: 'norwichcity', stoke: 'stokecity',
+         swansea: 'swanseacityafc', swanseacity: 'swanseacityafc', westbrom: 'westbromwichalbion', cardiff: 'cardiffcity' },
+  NCAAF: { pitt: 'pittsburgh', cal: 'california', uconn: 'connecticut', umass: 'massachusetts', appstate: 'appalachianstate', bostoncollege: 'boston',
+           fiu: 'floridaintl', floridainternational: 'floridaintl', louisiana: 'louisianalafayette', ullafayette: 'louisianalafayette', ulm: 'louisianamonroe',
+           ulmonroe: 'louisianamonroe', samhouston: 'samhoustonstate', utsa: 'texassanantonio', southernmiss: 'southernmississippi', jaxstate: 'jacksonvillestate',
+           latech: 'louisianatech', miamifl: 'miami', miamiohio: 'miamioh', mississippi: 'olemiss', unc: 'northcarolina', pennsylvania: 'penn',
+           nmstate: 'newmexicostate', sfpa: 'stfrancispa' }
+};
+function logoKey(s) {
+  s = String(s == null ? '' : s).toLowerCase();
+  if (s.normalize) s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return s.replace(/[^a-z0-9]/g, '');
+}
+var LOGO_IDX = {};
+Object.keys(LOGO_FILES).forEach(function (lg) {
+  LOGO_IDX[lg] = {};
+  LOGO_FILES[lg].split(/\s+/).forEach(function (f) { if (f) LOGO_IDX[lg][logoKey(f)] = f; });
+});
+var logoMemo = {}, logoCache = {}, logoTimer = 0;
+function logoFile(league, team) {                                    // which file in the repo is this team? (null = none)
+  var idx = LOGO_IDX[league]; if (!idx || !team) return null;
+  var mk = league + '|' + team.name + '|' + team.abbr + '|' + (team._n && team._n[0]); if (logoMemo[mk] !== undefined) return logoMemo[mk];
+  var c = [team.name].concat(team._n || []), al = LOGO_ALIAS[league] || {}, found = null;
+  if (team._n && team._n[0] && team._n[2] && team._n[0].length > team._n[2].length && team._n[0].slice(-team._n[2].length) === team._n[2])
+    c.push(team._n[0].slice(0, team._n[0].length - team._n[2].length));                             // "Ohio State Buckeyes" - "Buckeyes" = "Ohio State"
+  for (var i = 0; i < c.length && !found; i++) { var k = logoKey(c[i]); if (k) found = idx[al[k] || k] || idx[k] || null; }
+  return (logoMemo[mk] = found);
+}
+function loadLogo(e, league, file) {
+  var bases = CFG.logoBase ? [CFG.logoBase] : LOGO_BASES, i = 0;
+  (function next() {
+    if (i >= bases.length) { e.state = 'fail'; return; }
+    var img = new Image(); img.crossOrigin = 'anonymous';                                           // CORS-clean, so the canvas never gets tainted
+    img.onload = function () {
+      try {
+        var S = 128, cv = document.createElement('canvas'); cv.width = cv.height = S;               // keep a small copy, drop the 150-800px original
+        var cx = cv.getContext('2d'), k = Math.min(S / img.naturalWidth, S / img.naturalHeight), w = img.naturalWidth * k, h = img.naturalHeight * k;
+        cx.drawImage(img, (S - w) / 2, (S - h) / 2, w, h);
+        var p = cx.getImageData(2, 2, 1, 1).data; e.solid = p[3] > 250 && p[0] > 235 && p[1] > 235 && p[2] > 235;   // logo that comes with a white square
+        e.cv = cv; e.state = 'ok';
+        if (!logoTimer) logoTimer = setTimeout(function () { logoTimer = 0; if (typeof bump === 'function') bump(); }, 150);   // redraw cards once a batch has arrived
+      } catch (err) { e.state = 'fail'; }
+    };
+    img.onerror = function () { i++; next(); };
+    img.src = bases[i] + LOGO_DIR[league] + '/' + file + '.png';
+  })();
+}
+function logoEntry(league, team) {
+  var f = logoFile(league, team); if (!f) return null;
+  var k = league + '/' + f, e = logoCache[k];
+  if (!e) { e = logoCache[k] = { state: 'loading', cv: null, solid: false }; loadLogo(e, league, f); }
+  return e;
+}
+
+/* ======================================================================
+   CARD DRAWING  (2D canvas -> texture)
+   ====================================================================== */
+var FONT = '"Barlow Condensed","Arial Narrow","Roboto Condensed",system-ui,sans-serif';
+var C = { text: '#eef3ff', dim: '#8fa3c9', faint: '#5d7197', up: '#38e58f', down: '#ff5c70', live: '#ff4a63', gold: '#ffd166', pill: '#16223d', pillLine: '#2c4272' };
+var PAD = 26;
+function font(ctx, w, px) { ctx.font = w + ' ' + px + 'px ' + FONT; }
+function hexA(hex, a) { var n = parseInt(hex.slice(1), 16); return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + a + ')'; }
+function rr(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function fitText(ctx, txt, x, y, maxW, w, px, align) {
+  ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  while (px > 14) { font(ctx, w, px); if (ctx.measureText(txt).width <= maxW) break; px -= 2; }
+  ctx.fillText(txt, x, y);
+}
+function arrow(ctx, x, y, s, dir, color) {
+  ctx.fillStyle = color; ctx.beginPath();
+  if (dir > 0) { ctx.moveTo(x, y - s); ctx.lineTo(x + s, y + s * 0.7); ctx.lineTo(x - s, y + s * 0.7); }
+  else { ctx.moveTo(x, y + s); ctx.lineTo(x + s, y - s * 0.7); ctx.lineTo(x - s, y - s * 0.7); }
+  ctx.closePath(); ctx.fill();
+}
+function flashOf(t, side) { return (t.flash.at && Date.now() - t.flash.at < FLASH_MS) ? t.flash[side] : 0; }
+function labelVal(ctx, x, y, label, val) {
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  font(ctx, 600, 20); ctx.fillStyle = C.faint; ctx.fillText(label, x, y);
+  var w = ctx.measureText(label).width;
+  font(ctx, 700, 30); ctx.fillStyle = C.text; ctx.fillText(String(val), x + w + 8, y + 1);
+}
+function frame(ctx, t) {
+  var W = ctx.canvas.width, H = ctx.canvas.height, L = LEAGUES[t.league] || { color: '#9fb4e0' };
+  ctx.clearRect(0, 0, W, H);
+  rr(ctx, 3, 3, W - 6, H - 6, 26);
+  var g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, 'rgba(20,32,58,.95)'); g.addColorStop(1, 'rgba(8,13,26,.95)');
+  ctx.fillStyle = g; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = 'rgba(125,155,215,.30)'; ctx.stroke();
+  ctx.save(); rr(ctx, 3, 3, W - 6, H - 6, 26); ctx.clip(); ctx.fillStyle = L.color; ctx.fillRect(0, 0, W, 6); ctx.restore();
+  font(ctx, 700, 24); var tw = ctx.measureText(t.league).width;
+  rr(ctx, PAD, 25, tw + 24, 34, 9); ctx.fillStyle = hexA(L.color, 0.22); ctx.fill();
+  ctx.fillStyle = L.color; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(t.league, PAD + 12, 43);
+}
+function simTag(ctx, t, y) {                                         // small source label at the bottom of a card
+  var s = t.simulated ? 'SIMULATED DATA' : (t.tag || ''); if (!s) return;
+  font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(s, PAD, y);
+}
+function logoChip(ctx, league, team, cx, cy, r) {                    // team logo on a light disc, or an initials badge when there is none
+  var e = logoEntry(league, team);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 6.2832); ctx.closePath(); ctx.fillStyle = '#eef2fa'; ctx.fill();
+  if (e && e.state === 'ok') { ctx.clip(); var s = e.solid ? r * 2 : r * 1.62; ctx.drawImage(e.cv, cx - s / 2, cy - s / 2, s, s); }
+  else { ctx.fillStyle = '#24324f'; fitText(ctx, team.abbr || String(team.name).slice(0, 3).toUpperCase(), cx, cy + 1, r * 1.5, 700, Math.round(r * 0.95), 'center'); }
+  ctx.restore();
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(125,155,215,.45)'; ctx.beginPath(); ctx.arc(cx, cy, r, 0, 6.2832); ctx.stroke();
+}
+function teamName(ctx, t, side, y, o) {                              // [logo] + team name fitted into the space that is left; o.maxW is measured from the card edge padding
+  var lg = CFG.logos, x = PAD, w = o.maxW;
+  if (lg) { logoChip(ctx, t.league, t[side], PAD + o.r, y, o.r); x = PAD + o.r * 2 + 10; w = o.maxW - (x - PAD); }
+  ctx.fillStyle = o.color || C.text; fitText(ctx, t[side].name, x, y, w, 700, o.px);
+}
+function pricePill(ctx, x, y, w, h, price, fl) {
+  rr(ctx, x, y, w, h, 12);
+  ctx.fillStyle = fl > 0 ? 'rgba(56,229,143,.20)' : fl < 0 ? 'rgba(255,92,112,.20)' : C.pill; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = fl > 0 ? C.up : fl < 0 ? C.down : C.pillLine; ctx.stroke();
+  var x0 = x + (fl ? 42 : 12), avail = x + w - 10 - x0;               // text area; the arrow lives on the left when flashing
+  ctx.fillStyle = fl > 0 ? C.up : fl < 0 ? C.down : C.text;
+  fitText(ctx, fmtO(price), x0 + avail / 2, y + h / 2 + 2, avail, 700, 36, 'center');
+  if (fl) arrow(ctx, x + 24, y + h / 2, 9, fl, fl > 0 ? C.up : C.down);
+}
+
+function drawLive(ctx, t) {
+  var W = ctx.canvas.width, od = showOdds() && hasOdds(t), sc = showScores() && !!t.score;     // no prices yet -> big-score layout
+  var sides = [['away', t.away], ['home', t.home]];
+  frame(ctx, t);
+  var clk = t.clock || '', fin = t.state === 'final';
+  font(ctx, 600, 26); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = fin ? C.dim : C.text; ctx.fillText(clk, W - PAD, 43);
+  if (!fin) {
+    var cw = ctx.measureText(clk).width;
+    font(ctx, 700, 20); ctx.fillStyle = C.live; ctx.textAlign = 'right'; ctx.fillText('LIVE', W - PAD - cw - (clk ? 14 : 0), 43);
+    var lw = ctx.measureText('LIVE').width;
+    ctx.beginPath(); ctx.arc(W - PAD - cw - (clk ? 14 : 0) - lw - 14, 43, 6, 0, 6.2832); ctx.fill();
+  }
+  if (!od) {                                                         // scores only: big numbers, no prices
+    var ys2 = [124, 204];
+    sides.forEach(function (s, i) {
+      var side = s[0], y = ys2[i], other = side === 'home' ? 'away' : 'home';
+      var loser = fin && t.score && t.score[side] < t.score[other];
+      var hot = t.score && t.lastScore && t.lastScore.side === side && Date.now() - t.lastScore.at < SCORE_MS;
+      teamName(ctx, t, side, y, { r: 30, maxW: 300, px: 52, color: loser ? C.dim : C.text });
+      font(ctx, 700, 78); ctx.textAlign = 'right'; ctx.fillStyle = hot ? C.gold : (loser ? C.dim : C.text);
+      ctx.fillText(t.score ? String(t.score[side]) : '–', W - PAD, y + 3);
+    });
+    simTag(ctx, t, 298);
+    return;
+  }
+  var ys = [112, 182], lg = CFG.logos, pillX = lg ? 316 : 304, pillW = lg ? 170 : 182, scoreX = lg ? 304 : 290;      // a little more room for the logo
+  sides.forEach(function (s, i) {
+    var side = s[0], y = ys[i];
+    teamName(ctx, t, side, y, { r: 24, maxW: sc ? (lg ? 178 : 160) : (lg ? 270 : 250), px: 44 });
+    if (sc) {
+      var hot = t.lastScore && t.lastScore.side === side && Date.now() - t.lastScore.at < SCORE_MS;
+      font(ctx, 700, 50); ctx.textAlign = 'right'; ctx.fillStyle = hot ? C.gold : C.text; ctx.fillText(String(t.score[side]), scoreX, y + 2);
+    }
+    pricePill(ctx, pillX, y - 27, pillW, 54, t.ml[side], flashOf(t, side));
+  });
+  ctx.strokeStyle = 'rgba(125,155,215,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PAD, 228); ctx.lineTo(W - PAD, 228); ctx.stroke();
+  labelVal(ctx, PAD, 258, 'SPREAD', t.home.abbr + ' ' + fmtLine(t.spread.line));
+  labelVal(ctx, 290, 258, 'TOTAL', t.total.line == null ? '—' : t.total.line);
+  simTag(ctx, t, 298);
+}
+
+function drawLines(ctx, t) {
+  var W = ctx.canvas.width;
+  frame(ctx, t);
+  font(ctx, 600, 24); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText(fmtStart(t.startTime), W - PAD, 43);
+  font(ctx, 600, 17); ctx.fillStyle = C.faint; ctx.textAlign = 'center';
+  ctx.fillText('SPREAD', 288, 88); ctx.fillText('MONEYLINE', 421, 88);
+  var ys = [136, 202], sides = [['away', t.away], ['home', t.home]];
+  sides.forEach(function (s, i) {
+    var side = s[0], y = ys[i], line = t.spread.line == null ? null : (side === 'home' ? t.spread.line : -t.spread.line || 0);
+    teamName(ctx, t, side, y, { r: 21, maxW: 196, px: 42 });
+    rr(ctx, 232, y - 28, 112, 56, 12); ctx.fillStyle = C.pill; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.pillLine; ctx.stroke();
+    font(ctx, 700, 28); ctx.textAlign = 'center'; ctx.fillStyle = C.text; ctx.fillText(fmtLine(line), 288, y - 6);
+    font(ctx, 600, 18); ctx.fillStyle = C.dim; ctx.fillText(fmtO(t.spread[side]), 288, y + 16);
+    pricePill(ctx, 356, y - 28, 130, 56, t.ml[side], flashOf(t, side));
+  });
+  labelVal(ctx, PAD, 266, 'TOTAL', t.total.line == null ? '—' : t.total.line);
+  labelVal(ctx, 214, 266, 'O', fmtO(t.total.over));
+  labelVal(ctx, 346, 266, 'U', fmtO(t.total.under));
+  simTag(ctx, t, 302);
+}
+
+function drawSchedule(ctx, t) {                                      // upcoming game without odds (Scores mode)
+  var W = ctx.canvas.width;
+  frame(ctx, t);
+  font(ctx, 600, 22); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText('UPCOMING', W - PAD, 43);
+  [['away', t.away, 122], ['home', t.home, 186]].forEach(function (r) {
+    teamName(ctx, t, r[0], r[2], { r: 28, maxW: 380, px: 54 });
+    font(ctx, 600, 18); ctx.fillStyle = C.faint; ctx.textAlign = 'right'; ctx.fillText(r[0].toUpperCase(), W - PAD, r[2] + 2);
+  });
+  ctx.strokeStyle = 'rgba(125,155,215,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PAD, 232); ctx.lineTo(W - PAD, 232); ctx.stroke();
+  font(ctx, 600, 18); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.fillText('STARTS', PAD, 256);
+  font(ctx, 700, 40); ctx.fillStyle = C.text; ctx.fillText(fmtStart(t.startTime) || 'TBD', PAD + 90, 258);
+  simTag(ctx, t, 302);
+}
+
+function spark(ctx, x, y, w, h, vals, openV, color) {
+  if (vals.length < 2) vals = [openV, openV];
+  var lo = Math.min(openV, Math.min.apply(null, vals)), hi = Math.max(openV, Math.max.apply(null, vals));
+  var pad = Math.max(0.02, (hi - lo) * 0.2); lo -= pad; hi += pad;
+  var X = function (i) { return x + w * i / (vals.length - 1); }, Y = function (v) { return y + h - (v - lo) / (hi - lo) * h; };
+  ctx.setLineDash([6, 6]); ctx.strokeStyle = 'rgba(143,163,201,.45)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, Y(openV)); ctx.lineTo(x + w, Y(openV)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.beginPath(); vals.forEach(function (v, i) { if (i) ctx.lineTo(X(i), Y(v)); else ctx.moveTo(X(i), Y(v)); });
+  ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.lineTo(x + w, y + h); ctx.lineTo(x, y + h); ctx.closePath();
+  var g = ctx.createLinearGradient(0, y, 0, y + h); g.addColorStop(0, hexA(color, 0.28)); g.addColorStop(1, hexA(color, 0)); ctx.fillStyle = g; ctx.fill();
+  ctx.beginPath(); ctx.arc(X(vals.length - 1), Y(vals[vals.length - 1]), 6, 0, 6.2832); ctx.fillStyle = color; ctx.fill();
+}
+function drawMove(ctx, t) {
+  var W = ctx.canvas.width, mv = moveInfo(t) || { d: 0, side: 'home', pp: 0 };
+  frame(ctx, t);
+  font(ctx, 600, 22); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText(t.simulated ? 'LINE MOVE' : 'MOVE SINCE LOAD', W - PAD, 43);
+  var order = mv.side === 'home' ? ['home', 'away'] : ['away', 'home'], ys = [108, 166];
+  order.forEach(function (side, i) {
+    var y = ys[i], dl = side === 'home' ? mv.d : -mv.d, dir = Math.abs(dl) < 0.05 ? 0 : (dl > 0 ? 1 : -1);
+    var col = dir > 0 ? C.up : dir < 0 ? C.down : C.dim;
+    teamName(ctx, t, side, y, { r: 19, maxW: CFG.logos ? 162 : 150, px: 40 });
+    font(ctx, 600, 26); ctx.textAlign = 'right'; ctx.fillStyle = C.faint; ctx.fillText(fmtO(t.open.ml && t.open.ml[side]), 262, y + 1);
+    ctx.strokeStyle = C.faint; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(272, y - 7); ctx.lineTo(281, y); ctx.lineTo(272, y + 7); ctx.stroke();
+    font(ctx, 700, 34); ctx.textAlign = 'left'; ctx.fillStyle = C.text; ctx.fillText(fmtO(t.ml[side]), 292, y + 1);
+    font(ctx, 700, 26); ctx.textAlign = 'right'; ctx.fillStyle = col; var txt = dir ? Math.abs(dl).toFixed(1) : '—'; ctx.fillText(txt, W - PAD, y + 1);
+    if (dir) arrow(ctx, W - PAD - ctx.measureText(txt).width - 14, y, 8, dir, col);
+  });
+  var vals = t.hist.map(function (p) { return mv.side === 'home' ? p : 1 - p; });
+  var oP = t.open.pHome == null ? 0.5 : (mv.side === 'home' ? t.open.pHome : 1 - t.open.pHome);
+  font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.fillText('WIN PROBABILITY TREND', PAD, 208);
+  spark(ctx, PAD, 222, W - PAD * 2, 56, vals, oP, C.up);
+  simTag(ctx, t, 302);
+}
+
+function statusHeader(ctx, t) {                                      // LIVE dot + clock (or FINAL) at the top right of a card
+  var W = ctx.canvas.width, clk = t.clock || '', fin = t.state === 'final';
+  font(ctx, 600, 26); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = fin ? C.dim : C.text; ctx.fillText(clk, W - PAD, 43);
+  if (fin || t.state !== 'live') return;
+  var cw = ctx.measureText(clk).width;
+  font(ctx, 700, 20); ctx.fillStyle = C.live; ctx.textAlign = 'right'; ctx.fillText('LIVE', W - PAD - cw - (clk ? 14 : 0), 43);
+  var lw = ctx.measureText('LIVE').width;
+  ctx.beginPath(); ctx.arc(W - PAD - cw - (clk ? 14 : 0) - lw - 14, 43, 6, 0, 6.2832); ctx.fill();
+}
+function rowTag(ctx, t, text) {                                      // small label right of the league badge ("BOX SCORE", "PLAYER PROPS")
+  font(ctx, 700, 24); var tw = ctx.measureText(t.league).width;
+  font(ctx, 600, 17); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(text, PAD + tw + 24 + 14, 44);
+}
+
+/* ---- BOX SCORE row: sits right above the Live row and uses the same list, so every card is directly over its game ---- */
+function boxView(t) {                                                // collapse marathon overtimes so the table never gets wider than 6 columns
+  var b = t.box, base = t.league === 'NHL' ? 3 : t.league === 'EPL' ? 2 : 4;
+  if (b.labels.length <= 6) return b;
+  var sum = function (a) { var v = null; for (var i = base; i < a.length; i++) if (a[i] != null) v = (v || 0) + a[i]; return v; };
+  return { labels: b.labels.slice(0, base).concat(['OT']), away: b.away.slice(0, base).concat([sum(b.away)]), home: b.home.slice(0, base).concat([sum(b.home)]),
+           cur: Math.min(b.cur, base), leaders: b.leaders, goals: b.goals };
+}
+function drawBox(ctx, t) {
+  var W = ctx.canvas.width, b = t.box && t.box.labels ? boxView(t) : null, fin = t.state === 'final';
+  frame(ctx, t); statusHeader(ctx, t); rowTag(ctx, t, 'BOX SCORE');
+  var sides = [['away', t.away, 124], ['home', t.home, 168]], nP = b ? b.labels.length : 0;
+  var right = W - PAD - 66, cw = nP ? Math.min(58, 270 / nP) : 0;       // period columns end at `right`, the total column follows
+  if (b) b.labels.forEach(function (lb, i) {
+    var cx = right - cw * (nP - i - 0.5);
+    font(ctx, 600, 18); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = (!fin && i === b.cur) ? C.text : C.faint; ctx.fillText(lb, cx, 86);
+  });
+  font(ctx, 600, 18); ctx.textAlign = 'center'; ctx.fillStyle = C.faint; ctx.fillText('T', W - PAD - 28, 86);
+  sides.forEach(function (sd) {
+    var side = sd[0], team = sd[1], y = sd[2], other = side === 'home' ? 'away' : 'home', tot = t.score ? t.score[side] : null;
+    var loser = fin && t.score && t.score[side] < t.score[other], hot = t.score && t.lastScore && t.lastScore.side === side && Date.now() - t.lastScore.at < SCORE_MS;
+    if (CFG.logos) logoChip(ctx, t.league, team, PAD + 17, y, 17);
+    ctx.fillStyle = loser ? C.dim : C.text; fitText(ctx, team.abbr || String(team.name).slice(0, 3).toUpperCase(), PAD + (CFG.logos ? 44 : 0), y, CFG.logos ? 74 : 110, 700, 34);
+    if (b) b[side].forEach(function (v, i) {
+      font(ctx, (!fin && i === b.cur) ? 700 : 600, 32); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = v == null ? C.faint : ((!fin && i === b.cur) ? C.text : C.dim);
+      ctx.fillText(v == null ? '–' : String(v), right - cw * (nP - i - 0.5), y + 2);
+    });
+    font(ctx, 700, 46); ctx.textAlign = 'center'; ctx.fillStyle = hot ? C.gold : (loser ? C.dim : C.text); ctx.fillText(tot == null ? '–' : String(tot), W - PAD - 28, y + 2);
+  });
+  ctx.strokeStyle = 'rgba(125,155,215,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PAD, 196); ctx.lineTo(W - PAD, 196); ctx.stroke();
+  var lead = b ? b.leaders : null, has = lead && (lead.away.length || lead.home.length), goals = b && b.goals && b.goals.length ? b.goals : null;
+  if (has) {                                                         // stat leaders: away on the left, home on the right, category in the middle
+    font(ctx, 700, 17); ctx.fillStyle = C.faint; ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left'; ctx.fillText(t.away.abbr, PAD, 209); ctx.textAlign = 'right'; ctx.fillText(t.home.abbr, W - PAD, 209);
+    var cats = [];                                                   // one row per category, so a team with no rushing leader leaves a gap instead of shifting the rows
+    lead.home.concat(lead.away).forEach(function (l) { if (cats.indexOf(l.c) < 0) cats.push(l.c); });
+    cats.slice(0, 3).forEach(function (c, i) {
+      var y = 231 + i * 25, la = lead.away.filter(function (l) { return l.c === c; })[0], lh = lead.home.filter(function (l) { return l.c === c; })[0];
+      font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'center'; ctx.fillText(c, W / 2, y);
+      if (la) { ctx.fillStyle = C.text; fitText(ctx, la.n + '  ' + la.v, PAD, y, 190, 600, 22, 'left'); }
+      if (lh) { ctx.fillStyle = C.text; fitText(ctx, lh.n + '  ' + lh.v, W - PAD, y, 190, 600, 22, 'right'); }
+    });
+  } else if (goals) {                                                // hockey / soccer: the latest scoring plays
+    goals.slice(-3).forEach(function (gl, i) {
+      var y = 220 + i * 29, tm = gl.side === 'home' ? t.home : t.away;
+      font(ctx, 600, 20); ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(gl.t, PAD, y);
+      ctx.fillStyle = C.text; fitText(ctx, gl.n || 'Goal', PAD + 70, y, 250, 600, 24, 'left');
+      font(ctx, 700, 20); ctx.fillStyle = C.dim; ctx.textAlign = 'right'; ctx.fillText(tm.abbr, W - PAD, y);
+    });
+  } else {
+    font(ctx, 600, 22); ctx.fillStyle = C.faint; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(b ? 'Player stats not posted yet' : 'Box score not available', W / 2, 248);
+  }
+  simTag(ctx, t, 306);
+}
+
+/* ---- PLAYER PROPS row: one card per game that has props, paged every few seconds ---- */
+var PROP_PAGE = 4, PROP_MS = 5000;
+function propPage(t) { var n = Math.ceil(((t.props && t.props.length) || 0) / PROP_PAGE); return n > 1 ? Math.floor(Date.now() / PROP_MS) % n : 0; }
+function propPill(ctx, x, y, w, h, price, thin) {
+  rr(ctx, x, y, w, h, 11); ctx.fillStyle = C.pill; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.pillLine;
+  if (thin) ctx.setLineDash([6, 5]); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = thin ? C.dim : C.text; fitText(ctx, fmtO(price), x + w / 2, y + h / 2 + 2, w - 12, 700, 28, 'center');
+}
+function drawProps(ctx, t) {
+  var W = ctx.canvas.width, list = t.props || [], pages = Math.max(1, Math.ceil(list.length / PROP_PAGE)), pg = Math.min(propPage(t), pages - 1);
+  frame(ctx, t); rowTag(ctx, t, 'PLAYER PROPS');
+  if (t.state === 'live') statusHeader(ctx, t);
+  else { font(ctx, 600, 24); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.dim; ctx.fillText(fmtStart(t.startTime), W - PAD, 43); }
+  var mid = (t.away.abbr || '?') + '  @  ' + (t.home.abbr || '?');
+  if (CFG.logos) { logoChip(ctx, t.league, t.away, PAD + 16, 88, 16); logoChip(ctx, t.league, t.home, PAD + 168, 88, 16); }
+  font(ctx, 700, 30); ctx.fillStyle = C.text; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  if (CFG.logos) { ctx.fillText(t.away.abbr, PAD + 40, 89); ctx.fillStyle = C.faint; ctx.fillText('@', PAD + 106, 89); ctx.fillStyle = C.text; ctx.fillText(t.home.abbr, PAD + 192, 89); }
+  else ctx.fillText(mid, PAD, 89);
+  font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'center'; ctx.fillText('OVER', 362, 89); ctx.fillText('UNDER', 450, 89);
+  ctx.strokeStyle = 'rgba(125,155,215,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PAD, 109); ctx.lineTo(W - PAD, 109); ctx.stroke();
+  var anyThin = false;
+  list.slice(pg * PROP_PAGE, pg * PROP_PAGE + PROP_PAGE).forEach(function (pr, i) {
+    var y = 139 + i * 43, thin = !!pr.thin; anyThin = anyThin || thin;
+    ctx.fillStyle = thin ? C.dim : C.text; fitText(ctx, pr.name, PAD, y - 8, 285, 700, 26, 'left');                       // player on top, stat + line underneath
+    font(ctx, 600, 17); ctx.fillStyle = thin ? C.faint : C.dim; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(pr.stat + (pr.kind === 'ou' && pr.line != null ? '   O/U ' + pr.line : ''), PAD, y + 13);
+    if (pr.kind === 'ou') { propPill(ctx, 322, y - 19, 80, 38, toAmerican(pr.p), thin); propPill(ctx, 410, y - 19, 76, 38, toAmerican(1 - pr.p), thin); }
+    else { propPill(ctx, 322, y - 19, 80, 38, toAmerican(pr.p), thin); font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('YES', 450, y); }
+  });
+  simTag(ctx, t, 306);
+  var foot = (anyThin ? 'DASHED = THIN MARKET' : '') + (anyThin && pages > 1 ? '  ·  ' : '') + (pages > 1 ? (pg + 1) + '/' + pages : '');
+  if (foot) { font(ctx, 600, 15); ctx.fillStyle = C.faint; ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(foot, W - PAD, 306); }
+}
+
+rows[0].draw = drawLive;
+rows[1].draw = function (ctx, t) { (showOdds() && hasOdds(t) ? drawLines : drawSchedule)(ctx, t); };
+rows[2].draw = drawMove;
+rowByKey.box.draw = drawBox;    rowByKey.box.verOf = function (t) { return t.version + (t.bver || 0); };
+rowByKey.props.draw = drawProps; rowByKey.props.verOf = function (t) { return t.version + (t.pver || 0) + propPage(t) * 1e6; };
+function rowOn(r) {
+  if (r.optIn ? CFG.rows[r.key] !== true : CFG.rows[r.key] === false) return false;           // box + props are opt-in, the others opt-out
+  if (r.key === 'moves' || r.key === 'props') return showOdds();                                // odds-only rows
+  if (r.key === 'box') return showScores();
+  return true;
+}
+
+/* ======================================================================
+   THREE.JS SCENE
+   ====================================================================== */
+var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x03060d, 1);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.xr.enabled = true;
+renderer.xr.setFramebufferScaleFactor(1.2);
+$('stage').appendChild(renderer.domElement);
+
+var scene = new THREE.Scene();
+var bgColor = new THREE.Color(0x03060d);
+scene.background = bgColor;
+var camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 200);
+camera.rotation.order = 'YXZ';
+camera.position.set(0, CFG.eye, 0);
+scene.add(camera);
+
+// ambience: floor grid, marker ring, stars (so you always know which way is down). Hidden in passthrough.
+var envGroup = new THREE.Group(); scene.add(envGroup);
+var grid = new THREE.GridHelper(40, 40, 0x16325c, 0x0b1a33); grid.material.transparent = true; grid.material.opacity = 0.55; envGroup.add(grid);
+var ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 0.95, 64), new THREE.MeshBasicMaterial({ color: 0x2f64c8, transparent: true, opacity: 0.7, side: THREE.DoubleSide }));
+ring.rotation.x = -Math.PI / 2; ring.position.y = 0.01; envGroup.add(ring);
+(function () {
+  var n = 700, pos = new Float32Array(n * 3);
+  for (var i = 0; i < n; i++) {
+    var u = Math.random() * 2 - 1, a = Math.random() * 6.2832, r = Math.sqrt(1 - u * u), d = rand(40, 90);
+    pos[i * 3] = r * Math.cos(a) * d; pos[i * 3 + 1] = Math.abs(u) * d * 0.9 + 1; pos[i * 3 + 2] = r * Math.sin(a) * d;
+  }
+  var g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  envGroup.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x7f9ccc, size: 0.35, sizeAttenuation: true, transparent: true, opacity: 0.8 })));
+})();
+var xrMode = 'none';                       // 'none' | 'vr' | 'ar'
+function applyEnv() {
+  var ar = xrMode === 'ar';
+  envGroup.visible = CFG.env && !ar;
+  scene.background = ar ? null : bgColor;
+  renderer.setClearColor(0x03060d, ar ? 0 : 1);
+}
+
+// the ticker rig: sits at the viewer's head, tilted about the left-right axis
+var rig = new THREE.Group(); rig.position.set(0, CFG.eye, 0); scene.add(rig);
+var tiltGroup = new THREE.Group(); rig.add(tiltGroup);
+
+function fillPatch(geom, t0, t1, half) {
+  var R = CFG.radius, segS = 14, segT = 2, p = geom.attributes.position.array, k = 0;
+  for (var j = 0; j <= segT; j++) {
+    var t = MU.degToRad(t0 + (t1 - t0) * j / segT);
+    for (var i = 0; i <= segS; i++) {
+      var s = MU.degToRad(-half + 2 * half * i / segS);
+      p[k++] = R * Math.sin(s) * Math.cos(t); p[k++] = R * Math.sin(t); p[k++] = -R * Math.cos(s) * Math.cos(t);
+    }
+  }
+  geom.attributes.position.needsUpdate = true;
+}
+function makePatchGeometry() {
+  var segS = 14, segT = 2, g = new THREE.BufferGeometry(), uv = [], idx = [];
+  for (var j = 0; j <= segT; j++) for (var i = 0; i <= segS; i++) uv.push(i / segS, j / segT);
+  for (var j2 = 0; j2 < segT; j2++) for (var i2 = 0; i2 < segS; i2++) {
+    var a = j2 * (segS + 1) + i2, b = a + 1, c = a + segS + 1, d = c + 1; idx.push(a, c, b, b, c, d);
+  }
+  g.setIndex(idx);
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((segS + 1) * (segT + 1) * 3), 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  return g;
+}
+var aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+function buildRow(row, ri) {                                         // the opt-in rows (box score, props) only get their 16 meshes once they are first switched on
+  row.group = new THREE.Group();
+  row.geom = makePatchGeometry();
+  tiltGroup.add(row.group);
+  for (var i = 0; i < NCARDS; i++) {
+    var cv = document.createElement('canvas'); cv.width = CFG.cardPx[0]; cv.height = CFG.cardPx[1];
+    var tex = new THREE.CanvasTexture(cv); tex.encoding = THREE.sRGBEncoding; tex.anisotropy = aniso;
+    var mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false, toneMapped: false });
+    var mesh = new THREE.Mesh(row.geom, mat);
+    mesh.frustumCulled = false; mesh.renderOrder = 10 + ri; mesh.visible = false;
+    mesh.userData = { cv: cv, ctx: cv.getContext('2d'), tex: tex, item: null, ver: -1, epoch: -1 };
+    row.group.add(mesh); row.meshes.push(mesh);
+  }
+}
+rows.forEach(function (row, ri) { if (!row.optIn) buildRow(row, ri); });
+// Position the visible rows around the tilted great circle. Hidden rows are skipped so the rest re-centre.
+function applyGeometry() {
+  rows.forEach(function (r, ri) { if (!r.group && rowOn(r)) buildRow(r, ri); });
+  var g = geo(), vis = ROW_ORDER.map(function (k) { return rowByKey[k]; }).filter(rowOn), n = Math.max(1, vis.length);
+  tiltGroup.rotation.x = MU.degToRad(CFG.tilt);
+  var tc = (1 - CFG.tilt / 90) * (3 + n / 2 * g.rowH + (n - 1) / 2 * g.gap);   // above the horizon at low tilt, centred overhead at 90
+  rows.forEach(function (r) { if (r.group) r.group.visible = rowOn(r); });
+  vis.forEach(function (r, k) {
+    var c = tc + (k - (n - 1) / 2) * (g.rowH + g.gap);
+    fillPatch(r.geom, c - g.rowH / 2, c + g.rowH / 2, g.cardW / 2);
+  });
+}
+
+var epoch = 0, theta = 0, paused = false, budgetBoost = 3;
+function bump() { epoch++; budgetBoost = 3; }
+function layoutRow(row, g) {
+  if (!row.group || !row.group.visible) return;
+  var M = row.list.length, budget = budgetBoost > 0 ? 99 : 4, loop = NCARDS * g.pitch;
+  for (var i = 0; i < row.meshes.length; i++) {
+    var m = row.meshes[i], u = m.userData;
+    var s = (((i * g.pitch - theta + loop / 2) % loop) + loop) % loop - loop / 2;
+    var n = Math.round((s + theta) / g.pitch);
+    var item = M ? row.list[((n % M) + M) % M] : null;
+    var o = clamp((g.fadeEnd - Math.abs(s)) / (g.fadeEnd - g.fadeStart), 0, 1);
+    m.rotation.y = -MU.degToRad(s);
+    m.visible = !!item && o > 0.01 && (u.ver >= 0 || budget > 0);
+    if (!item || o <= 0.01) continue;
+    var vk = row.verOf ? row.verOf(item) : item.version;
+    if ((item !== u.item || vk !== u.ver || u.epoch !== epoch) && budget > 0) {
+      row.draw(u.ctx, item); u.tex.needsUpdate = true; u.item = item; u.ver = vk; u.epoch = epoch; budget--;
+    }
+    m.material.opacity = o * CFG.opacity;
+    m.material.color.setScalar(CFG.brightness);
+  }
+}
+
+// brief floating message (used for headset button feedback)
+var tcv = document.createElement('canvas'); tcv.width = 512; tcv.height = 96;
+var ttex = new THREE.CanvasTexture(tcv); ttex.encoding = THREE.sRGBEncoding;
+var toastSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: ttex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }));
+toastSprite.scale.set(0.8, 0.15, 1); toastSprite.renderOrder = 999; toastSprite.visible = false; scene.add(toastSprite);
+var toastUntil = 0, _p = new THREE.Vector3(), _d = new THREE.Vector3();
+function toast(txt) {
+  var c = tcv.getContext('2d'); c.clearRect(0, 0, 512, 96);
+  rr(c, 4, 4, 504, 88, 28); c.fillStyle = 'rgba(10,16,30,.9)'; c.fill(); c.strokeStyle = 'rgba(125,155,215,.5)'; c.lineWidth = 3; c.stroke();
+  font(c, 700, 44); c.fillStyle = '#eef3ff'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(txt, 256, 50);
+  ttex.needsUpdate = true;
+  camera.updateMatrixWorld(); camera.getWorldPosition(_p); camera.getWorldDirection(_d);
+  toastSprite.position.copy(_p).addScaledVector(_d, 1.6); toastSprite.position.y -= 0.2;
+  toastSprite.visible = true; toastUntil = performance.now() + 1800;
+}
+
+/* ======================================================================
+   SETTINGS SCHEMA  (one list drives both the on-screen panel and the in-headset panel)
+   ====================================================================== */
+function onFilter() { rebuildLists(); refreshMovers(); }
+function pokeProps() { if (feeds.live && feeds.live.pokeProps) feeds.live.pokeProps(); }        // tell the live feed to start/stop fetching player props
+function step(label, key, min, max, inc, get, set, fmt) { return { type: 'step', label: label, min: min, max: max, inc: inc, get: get, set: set, fmt: fmt }; }
+var statusKind = 'sim', statusText = 'Starting…';
+function setStatus(kind, text, tagText) {                                // kind: 'live' | 'warn' | 'sim'
+  statusKind = kind; statusText = text;
+  var b = $('srcTag'); if (b) { b.textContent = tagText || text; b.className = kind === 'live' ? 'live' : kind === 'warn' ? 'warn' : ''; }
+  syncUI();
+}
+var UI = [
+  { type: 'seg', label: 'Data source', opts: [['live', 'Live: ESPN + Polymarket'], ['sim', 'Simulated']],
+    get: function () { return CFG.source; }, set: function (v) { if (CFG.source === v) return; CFG.source = v; saveSettings(); activate(); } },
+  { type: 'info', get: function () { return (statusKind === 'live' ? '● ' : statusKind === 'warn' ? '▲ ' : '○ ') + statusText; } },
+  { type: 'seg', label: 'Show', opts: [['both', 'Scores + odds'], ['scores', 'Scores'], ['odds', 'Odds']],
+    get: function () { return CFG.content; }, set: function (v) { CFG.content = v; onFilter(); bump(); applyGeometry(); pokeProps(); } },
+  { type: 'chips', label: 'Leagues', items: function () {
+      var its = LEAGUE_ORDER.map(function (k) {
+        return { label: k, on: leagueOn(k), fn: function () { CFG.leagues[k] = !leagueOn(k); onFilter(); } };
+      });
+      its.push({ label: 'All', fn: function () { CFG.leagues = {}; onFilter(); } });
+      its.push({ label: 'None', fn: function () { LEAGUE_ORDER.forEach(function (k) { CFG.leagues[k] = false; }); onFilter(); } });
+      return its;
+    } },
+  { type: 'chips', label: 'Rows (bottom to top)', items: function () {
+      return [['live', 'Live'], ['box', 'Box score'], ['lines', showOdds() ? 'Lines' : 'Schedule'], ['moves', 'Moves'], ['props', 'Props']].map(function (r) {
+        var k = r[0], opt = rowByKey[k].optIn;                                                        // box score + props are off until switched on
+        return { label: r[1], on: opt ? CFG.rows[k] === true : CFG.rows[k] !== false,
+                 fn: function () { CFG.rows[k] = opt ? CFG.rows[k] !== true : CFG.rows[k] === false; applyGeometry(); bump(); if (k === 'props') pokeProps(); } };
+      });
+    } },
+  { type: 'seg', label: 'Props for', opts: [['all', 'All games'], ['live', 'Live'], ['pre', 'Upcoming']], show: function () { return CFG.rows.props === true; },      // only while the Props row is on
+    get: function () { return CFG.propsFor; }, set: function (v) { CFG.propsFor = v; rebuildLists(); bump(); } },
+  { type: 'seg', label: 'Odds format', opts: [['us', 'American'], ['dec', 'Decimal'], ['pct', 'Implied %']],
+    get: function () { return CFG.fmt; }, set: function (v) { CFG.fmt = v; bump(); } },
+  step('Tilt', 'tilt', 0, 90, 5, function () { return CFG.tilt; }, function (v) { CFG.tilt = v; applyGeometry(); }, function (v) { return Math.round(v) + '°'; }),
+  step('Size', 'size', 65, 140, 5, function () { return Math.round(CFG.size * 100); }, function (v) { CFG.size = v / 100; applyGeometry(); }, function (v) { return Math.round(v) + '%'; }),
+  step('Arc', 'arc', 90, 180, 10, function () { return CFG.arc; }, function (v) { CFG.arc = v; }, function (v) { return Math.round(v) + '°'; }),
+  step('Speed', 'speed', 0, 15, 0.5, function () { return CFG.speed; }, function (v) { CFG.speed = v; }, function (v) { return v.toFixed(1) + '°/s'; }),
+  step('Brightness', 'bright', 25, 100, 5, function () { return Math.round(CFG.brightness * 100); }, function (v) { CFG.brightness = v / 100; }, function (v) { return Math.round(v) + '%'; }),
+  step('Opacity', 'opacity', 30, 100, 5, function () { return Math.round(CFG.opacity * 100); }, function (v) { CFG.opacity = v / 100; }, function (v) { return Math.round(v) + '%'; }),
+  { type: 'toggle', label: 'Reverse direction', get: function () { return CFG.reverse; }, set: function (v) { CFG.reverse = v; } },
+  { type: 'toggle', label: 'Team logos', get: function () { return CFG.logos; }, set: function (v) { CFG.logos = v; bump(); } },
+  { type: 'toggle', label: 'Floor grid + stars (VR)', get: function () { return CFG.env; }, set: function (v) { CFG.env = v; applyEnv(); } }
+];
+UI.forEach(function (u) { if (u.type === 'step') u.step = u.inc < 1 ? u.inc : 1; });     // DOM slider granularity
+
+var SAVE_KEYS = ['source', 'proxy', 'logos', 'logoBase', 'content', 'fmt', 'tilt', 'size', 'arc', 'speed', 'reverse', 'brightness', 'opacity', 'env', 'leagues', 'rows', 'propsFor'];
+function saveSettings() {
+  try { var o = {}; SAVE_KEYS.forEach(function (k) { o[k] = CFG[k]; }); localStorage.setItem('oddsTicker.v2', JSON.stringify(o)); } catch (e) {}
+}
+function loadSettings() {
+  try {
+    var o = JSON.parse(localStorage.getItem('oddsTicker.v2') || 'null'); if (!o) return;
+    SAVE_KEYS.forEach(function (k) { if (o[k] !== undefined && typeof o[k] === typeof CFG[k]) CFG[k] = o[k]; });
+    CFG.tilt = clamp(CFG.tilt, 0, 90); CFG.size = clamp(CFG.size, 0.65, 1.4); CFG.arc = clamp(CFG.arc, 90, 180);
+    CFG.speed = clamp(CFG.speed, 0, 15); CFG.brightness = clamp(CFG.brightness, 0.25, 1); CFG.opacity = clamp(CFG.opacity, 0.3, 1);
+    if (['both', 'scores', 'odds'].indexOf(CFG.content) < 0) CFG.content = 'both';
+    if (['live', 'sim'].indexOf(CFG.source) < 0) CFG.source = 'live';
+    if (['us', 'dec', 'pct'].indexOf(CFG.fmt) < 0) CFG.fmt = 'us';
+    if (['all', 'live', 'pre'].indexOf(CFG.propsFor) < 0) CFG.propsFor = 'all';
+  } catch (e) {}
+}
+function act(fn) { fn(); syncUI(); saveSettings(); }
+function setPaused(v) { paused = v; syncUI(); }
+function setTilt(v) { act(function () { CFG.tilt = clamp(v, 0, 90); applyGeometry(); }); }
+
+/* ---------- on-screen panel (desktop / phone) ---------- */
+function el(tag, cls, txt) { var e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; }
+function domBuild() {
+  var p = $('panel'); p.innerHTML = '';
+  UI.forEach(function (u) {
+    var sec = el('div', 'sec');
+    if (u.type === 'seg') {
+      sec.appendChild(el('div', 'lab', u.label)); var g = el('div', 'grp'); u.dom = [];
+      u.opts.forEach(function (o) { var b = el('button', 'opt', o[1]); b.addEventListener('click', function () { act(function () { u.set(o[0]); }); }); g.appendChild(b); u.dom.push([o[0], b]); });
+      sec.appendChild(g);
+    } else if (u.type === 'chips') {
+      sec.appendChild(el('div', 'lab', u.label)); var g2 = el('div', 'grp'); u.dom = [];
+      u.items().forEach(function (it, i) {
+        var b = el('button', 'opt' + (it.on === undefined ? ' act' : ''), it.label);
+        b.addEventListener('click', function () { act(function () { u.items()[i].fn(); }); });
+        g2.appendChild(b); u.dom.push(b);
+      });
+      sec.appendChild(g2);
+    } else if (u.type === 'step') {
+      sec.className = 'stepline'; var r = document.createElement('input'), out = document.createElement('output');
+      r.type = 'range'; r.min = u.min; r.max = u.max; r.step = u.step;
+      r.addEventListener('input', function () { act(function () { u.set(+r.value); }); });
+      sec.appendChild(el('span', '', u.label)); sec.appendChild(r); sec.appendChild(out); u.dom = { r: r, out: out };
+    } else if (u.type === 'info') {
+      sec.className = 'status'; u.dom = { t: sec };
+    } else if (u.type === 'toggle') {
+      sec.className = 'tog'; var cb = document.createElement('input'); cb.type = 'checkbox';
+      cb.addEventListener('change', function () { act(function () { u.set(cb.checked); }); });
+      var lab = el('label', '', u.label); lab.insertBefore(cb, lab.firstChild); lab.style.display = 'flex'; lab.style.gap = '8px'; lab.style.alignItems = 'center';
+      sec.appendChild(lab); u.dom = { cb: cb };
+    }
+    u.sec = sec; p.appendChild(sec);
+  });
+  p.appendChild(el('p', 'note', 'Tilt: 0° = ribbon above the horizon, 90° = arch over your head. Passthrough (if your headset browser supports it) floats the ticker over your real room. In a headset: B/Y opens this menu as a floating panel (point and pull the trigger). ' +
+    'Trigger = pause, grip = cycle tilt, thumbstick up/down = speed, A/X = recenter. Green ▲ = odds shortened, red ▼ = lengthened. ' +
+    'Live mode: scores come from ESPN\'s public scoreboard, prices from Polymarket prediction markets (mid prices, no bookmaker margin, so they will not match a sportsbook). Simulated mode is demo data only. ' +
+    'Box score row (off by default): period-by-period scores and stat leaders, sitting right above the Live row so each card is over its own game. Props row (off by default): Polymarket player props for NBA and NFL; the card pages through a game\'s props, and a dashed price box marks a thin market whose price is not reliable. With five rows on, the cards shrink to about 70% so the stack stays in comfortable view; Size still scales everything.'));
+  syncUI();
+}
+var vrDirty = true;
+function syncUI() {
+  UI.forEach(function (u) {
+    if (!u.dom) return;
+    if (u.sec && u.show) u.sec.style.display = u.show() ? '' : 'none';
+    if (u.type === 'seg') u.dom.forEach(function (d) { d[1].classList.toggle('on', u.get() === d[0]); });
+    else if (u.type === 'chips') { var its = u.items(); u.dom.forEach(function (b, i) { if (its[i]) { b.textContent = its[i].label; b.classList.toggle('on', !!its[i].on); } }); }
+    else if (u.type === 'step') { u.dom.r.value = u.get(); u.dom.out.textContent = u.fmt(u.get()); }
+    else if (u.type === 'toggle') u.dom.cb.checked = !!u.get();
+    else if (u.type === 'info') u.dom.t.textContent = u.get();
+  });
+  $('btnPause').textContent = paused ? 'Play' : 'Pause';
+  vrDirty = true;
+}
+
+/* ---------- floating panel for headsets ---------- */
+var vrW = 1100, panelOpen = false, vrHover = null, vrLayoutCache = null;
+var pcv = document.createElement('canvas'); pcv.width = vrW; pcv.height = 1100;
+var pctx = pcv.getContext('2d');
+var ptex = new THREE.CanvasTexture(pcv); ptex.encoding = THREE.sRGBEncoding; ptex.anisotropy = aniso;
+var panel = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), new THREE.MeshBasicMaterial({ map: ptex, transparent: true, side: THREE.DoubleSide, depthTest: false, toneMapped: false }));
+panel.renderOrder = 1000; panel.visible = false; scene.add(panel);
+
+function fnSet(u, k) { return function () { u.set(k); }; }               // bind per item: closures over the loop variable would all see the last item
+function fnChip(u, j) { return function () { u.items()[j].fn(); }; }
+function vrBuild() {                                         // lay the schema out as labelled, clickable rectangles
+  var hits = [], labels = [], y = 100, pad = 30, gap = 12, BH = 80, idc = 0;
+  function btn(x, yy, w, label, on, fn, kind) { hits.push({ id: idc++, x: x, y: yy, w: w, h: BH, label: label, on: on, fn: fn, kind: kind || '' }); }
+  var i = 0;
+  hits.push({ id: idc++, x: vrW - pad - 150, y: 20, w: 150, h: 64, label: 'Close', fn: function () { closePanel(); }, kind: 'close' });
+  while (i < UI.length) {
+    var u = UI[i];
+    if (u.show && !u.show()) { i++; continue; }
+    if (u.type === 'seg') {
+      labels.push({ x: pad, y: y + 14, text: u.label.toUpperCase(), size: 26 }); y += 38;
+      var n = u.opts.length, bw = (vrW - 2 * pad - (n - 1) * gap) / n;
+      u.opts.forEach(function (o, j) { btn(pad + j * (bw + gap), y, bw, o[1], u.get() === o[0], fnSet(u, o[0])); });
+      y += BH + 24; i++;
+    } else if (u.type === 'chips') {
+      labels.push({ x: pad, y: y + 14, text: u.label.toUpperCase(), size: 26 }); y += 38;
+      var its = u.items(), per = its.length <= 7 ? its.length : Math.ceil(its.length / Math.ceil(its.length / 7));      // up to 7 per row; beyond that balanced rows (e.g. 9 -> 5 + 4)
+      for (var r0 = 0; r0 < its.length; r0 += per) {
+        var rowIts = its.slice(r0, r0 + per), kk = rowIts.length, cw = (vrW - 2 * pad - (kk - 1) * gap) / kk;       // every row spans the full panel width
+        rowIts.forEach(function (it, j) { btn(pad + j * (cw + gap), y, cw, it.label, it.on, fnChip(u, r0 + j), it.on === undefined ? 'act' : ''); });
+        y += BH + gap;
+      }
+      y += 24 - gap; i++;
+    } else if (u.type === 'step') {
+      var run = []; while (i < UI.length && UI[i].type === 'step') { run.push(UI[i]); i++; }
+      var colW = (vrW - 2 * pad - 40) / 2;
+      run.forEach(function (s, j) {
+        var cx = pad + (j % 2) * (colW + 40), cy = y + Math.floor(j / 2) * (BH + 12);
+        labels.push({ x: cx, y: cy + BH / 2, text: s.label, size: 28, color: C.dim });
+        var minus = (function (ss) { return function () { ss.set(clamp(ss.get() - ss.inc, ss.min, ss.max)); }; })(s);
+        var plus = (function (ss) { return function () { ss.set(clamp(ss.get() + ss.inc, ss.min, ss.max)); }; })(s);
+        hits.push({ id: idc++, x: cx + colW - 330, y: cy, w: 80, h: BH, label: '−', fn: minus, kind: 'step' });
+        labels.push({ x: cx + colW - 165, y: cy + BH / 2, text: s.fmt(s.get()), size: 34, color: C.text, align: 'center' });
+        hits.push({ id: idc++, x: cx + colW - 80, y: cy, w: 80, h: BH, label: '+', fn: plus, kind: 'step' });
+      });
+      y += Math.ceil(run.length / 2) * (BH + 12) + 18;
+    } else if (u.type === 'info') {
+      labels.push({ x: pad, y: y + 2, text: u.get(), size: 24, color: statusKind === 'live' ? C.up : statusKind === 'warn' ? C.gold : C.dim, maxW: vrW - 2 * pad });
+      y += 40; i++;
+    } else if (u.type === 'toggle') {
+      var bw3 = (vrW - 2 * pad - gap) / 2, tl = [];
+      while (i < UI.length && UI[i].type === 'toggle') { tl.push(UI[i]); i++; }
+      tl.forEach(function (tu, k2) {
+        var alone = k2 === tl.length - 1 && tl.length % 2 === 1;                                                   // an odd one out spans the whole row instead of leaving a hole
+        btn(alone ? pad : pad + (k2 % 2) * (bw3 + gap), y + Math.floor(k2 / 2) * (BH + gap), alone ? vrW - 2 * pad : bw3, tu.label, tu.get(), (function (t2) { return function () { t2.set(!t2.get()); }; })(tu));
+      });
+      y += Math.ceil(tl.length / 2) * (BH + gap) + 12;
+    } else i++;
+  }
+  return { hits: hits, labels: labels, H: y + 20 };
+}
+function vrDraw(Lo) {
+  var c = pctx, W = vrW, H = pcv.height;
+  c.clearRect(0, 0, W, H);
+  rr(c, 4, 4, W - 8, H - 8, 44); c.fillStyle = 'rgba(10,16,30,.97)'; c.fill(); c.lineWidth = 4; c.strokeStyle = 'rgba(125,155,215,.45)'; c.stroke();
+  c.textBaseline = 'middle'; font(c, 700, 50); c.fillStyle = C.text; c.textAlign = 'left'; c.fillText('Settings', 30, 52);
+  Lo.labels.forEach(function (l) {
+    font(c, 600, l.size); c.fillStyle = l.color || C.faint; c.textAlign = l.align || 'left';
+    if (l.maxW) c.fillText(l.text, l.x, l.y, l.maxW); else c.fillText(l.text, l.x, l.y);
+  });
+  Lo.hits.forEach(function (b) {
+    rr(c, b.x, b.y, b.w, b.h, 18);
+    c.fillStyle = b.on ? '#2a5bd7' : (b.kind === 'act' ? 'rgba(18,29,54,.5)' : '#16223d'); c.fill();
+    if (vrHover === b.id) { c.fillStyle = 'rgba(255,255,255,.16)'; c.fill(); }
+    c.lineWidth = vrHover === b.id ? 5 : 3; c.strokeStyle = vrHover === b.id ? '#9cc0ff' : (b.on ? '#4b7cf0' : '#2c4272');
+    if (b.kind === 'act') c.setLineDash([10, 8]); c.stroke(); c.setLineDash([]);
+    c.fillStyle = b.on ? '#fff' : C.text; fitText(c, b.label, b.x + b.w / 2, b.y + b.h / 2 + 2, b.w - 20, b.kind === 'step' ? 700 : 600, b.kind === 'step' ? 56 : 34, 'center');
+  });
+}
+function vrEnsure(H) {                                       // resize canvas + plane when the layout height changes
+  if (pcv.height === H) return;
+  pcv.height = H;
+  panel.geometry.dispose(); panel.geometry = new THREE.PlaneGeometry(1.5, 1.5 * H / vrW);
+  ptex.dispose(); ptex = new THREE.CanvasTexture(pcv); ptex.encoding = THREE.sRGBEncoding; ptex.anisotropy = aniso;
+  panel.material.map = ptex; panel.material.needsUpdate = true;
+}
+function vrRefresh() {
+  var Lo = vrBuild(); vrEnsure(Lo.H); vrLayoutCache = Lo; vrDraw(Lo); ptex.needsUpdate = true;
+}
+function vrPick(x, y) {
+  if (!vrLayoutCache) return null;
+  for (var i = vrLayoutCache.hits.length - 1; i >= 0; i--) {
+    var b = vrLayoutCache.hits[i];
+    if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+  }
+  return null;
+}
+function openPanel() {
+  camera.updateMatrixWorld(); camera.getWorldPosition(_p); camera.getWorldDirection(_d);
+  _d.y = clamp(_d.y, -0.25, 0.25); var len = Math.sqrt(_d.x * _d.x + _d.y * _d.y + _d.z * _d.z) || 1;
+  panel.position.set(_p.x + _d.x / len * 1.35, _p.y - 0.08 + _d.y / len * 1.35, _p.z + _d.z / len * 1.35);
+  panel.lookAt(_p.x, panel.position.y, _p.z);
+  panel.updateMatrixWorld();
+  panelOpen = true; panel.visible = true; vrDirty = true;
+  ctrl.forEach(function (c) { if (c.userData.line) c.userData.line.visible = true; });
+}
+function closePanel() {
+  panelOpen = false; panel.visible = false; vrHover = null;
+  ctrl.forEach(function (c) { if (c.userData.line) c.userData.line.visible = false; });
+}
+
+/* ---------- controllers ---------- */
+var ray = new THREE.Raycaster(), _m = new THREE.Matrix4();
+var ctrl = [0, 1].map(function (i) {
+  var c = renderer.xr.getController(i);
+  var lg = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+  var line = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0x7fb2ff }));
+  line.visible = false; line.scale.z = 3; c.add(line); c.userData.line = line;
+  c.addEventListener('connected', function (e) { c.userData.src = e.data; });
+  c.addEventListener('disconnected', function () { c.userData.src = null; });
+  scene.add(c);
+  return c;
+});
+function vrRay(c) {                                          // where does this controller's laser hit the panel?
+  _m.identity().extractRotation(c.matrixWorld);
+  ray.ray.origin.setFromMatrixPosition(c.matrixWorld);
+  ray.ray.direction.set(0, 0, -1).applyMatrix4(_m);
+  var h = ray.intersectObject(panel, false);
+  return h && h.length ? h[0] : null;
+}
+
+/* ======================================================================
+   DESKTOP / PHONE CONTROLS
+   ====================================================================== */
+var yaw = 0, pitch = MU.degToRad(32), dragging = false, lx = 0, ly = 0;
+function applyView() { camera.rotation.set(pitch, yaw, 0); }
+function onResize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.fov = camera.aspect < 1 ? 95 : 70; camera.updateProjectionMatrix();
+}
+renderer.domElement.addEventListener('pointerdown', function (e) { dragging = true; lx = e.clientX; ly = e.clientY; try { renderer.domElement.setPointerCapture(e.pointerId); } catch (x) {} });
+renderer.domElement.addEventListener('pointerup', function () { dragging = false; });
+renderer.domElement.addEventListener('pointercancel', function () { dragging = false; });
+renderer.domElement.addEventListener('pointermove', function (e) {
+  if (!dragging || renderer.xr.isPresenting) return;
+  var k = 0.0045 * (camera.fov / 70);
+  yaw += (e.clientX - lx) * k; pitch = clamp(pitch + (e.clientY - ly) * k, -1.2, 1.55); lx = e.clientX; ly = e.clientY; applyView();
+});
+renderer.domElement.addEventListener('wheel', function (e) {
+  e.preventDefault(); camera.fov = clamp(camera.fov + e.deltaY * 0.03, 35, 110); camera.updateProjectionMatrix();
+}, { passive: false });
+window.addEventListener('resize', onResize);
+window.addEventListener('keydown', function (e) { if (e.code === 'Space') { e.preventDefault(); setPaused(!paused); } });
+$('btnPause').addEventListener('click', function () { setPaused(!paused); });
+$('btnGear').addEventListener('click', function () { var p = $('panel'); p.hidden = !p.hidden; });
+
+/* ---------- headset sessions (VR and passthrough) ---------- */
+var xrFrames = 0, pad = {}, presetIdx = 1, lastSpeedToast = 0;
+function recenter() {
+  camera.updateMatrixWorld(); camera.getWorldPosition(_p); camera.getWorldDirection(_d);
+  rig.position.copy(_p); rig.rotation.y = Math.atan2(-_d.x, -_d.z);
+  toast('Recentered');
+}
+function pollXR(dt) {
+  var hoverNow = null;
+  ctrl.forEach(function (c, ci) {
+    var src = c.userData.src, gp = src && src.gamepad; if (!gp) return;
+    var st = pad[ci] || (pad[ci] = {});
+    var edge = function (i, fn) { var now = !!(gp.buttons[i] && gp.buttons[i].pressed); if (now && !st[i]) fn(); st[i] = now; };
+    var hit = panelOpen ? vrRay(c) : null, pt = null, over = null;
+    if (hit && hit.uv) { pt = { x: hit.uv.x * vrW, y: (1 - hit.uv.y) * pcv.height }; over = vrPick(pt.x, pt.y); if (over && hoverNow === null) hoverNow = over.id; }
+    if (c.userData.line) c.userData.line.scale.z = hit && hit.distance ? hit.distance : 3;
+    edge(0, function () {                                       // trigger: click when the menu is open, otherwise pause
+      if (panelOpen) { if (over) act(over.fn); }
+      else { setPaused(!paused); toast(paused ? 'Paused' : 'Playing'); }
+    });
+    edge(5, function () { if (panelOpen) closePanel(); else openPanel(); });      // B / Y: settings panel
+    edge(4, recenter);                                           // A / X: recenter the ticker around you
+    if (!panelOpen) {
+      edge(1, function () { presetIdx = (presetIdx + 1) % PRESETS.length; setTilt(PRESETS[presetIdx]); toast('Tilt ' + CFG.tilt + '°'); });
+      var y = gp.axes[3] || 0;                                   // thumbstick up/down: speed
+      if (Math.abs(y) > 0.35) {
+        CFG.speed = clamp(CFG.speed - y * dt * 5, 0, 15); syncUI();
+        if (performance.now() - lastSpeedToast > 600) { lastSpeedToast = performance.now(); saveSettings(); toast('Speed ' + CFG.speed.toFixed(1) + '°/s'); }
+      }
+    }
+  });
+  var hid = hoverNow; if (!panelOpen) hid = null;
+  if (hid !== vrHover) { vrHover = hid; vrDirty = true; }
+}
+function onXREnd() {
+  xrMode = 'none'; applyEnv(); closePanel();
+  rig.position.set(0, CFG.eye, 0); rig.rotation.y = 0; camera.position.set(0, CFG.eye, 0); applyView(); onResize();
+  $('btnVR').textContent = 'Enter VR'; $('btnAR').textContent = 'Passthrough';
+}
+var btnVR = $('btnVR'), btnAR = $('btnAR');
+async function startXR(mode) {
+  var cur = renderer.xr.getSession(); if (cur) { cur.end(); return; }
+  try {
+    var session = await navigator.xr.requestSession(mode === 'ar' ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
+    xrMode = mode; applyEnv();
+    renderer.xr.setReferenceSpaceType('local-floor');
+    await renderer.xr.setSession(session);
+    session.addEventListener('end', onXREnd, { once: true });
+    xrFrames = 0; bump();
+  } catch (err) {
+    console.warn(err); xrMode = 'none'; applyEnv();
+    (mode === 'ar' ? btnAR : btnVR).textContent = 'Could not start';
+  }
+}
+(async function initXR() {
+  if (!navigator.xr) { btnVR.textContent = 'VR not available'; return; }
+  try {
+    if (await navigator.xr.isSessionSupported('immersive-vr')) { btnVR.disabled = false; btnVR.textContent = 'Enter VR'; btnVR.classList.add('primary'); }
+    else btnVR.textContent = 'No headset found';
+  } catch (err) { btnVR.textContent = 'VR blocked here'; }
+  try {
+    if (await navigator.xr.isSessionSupported('immersive-ar')) { btnAR.hidden = false; btnAR.disabled = false; }
+  } catch (err) {}
+})();
+btnVR.addEventListener('click', function () { startXR('vr'); });
+btnAR.addEventListener('click', function () { startXR('ar'); });
+
+/* ---------- feeds ---------- */
+var feeds = { token: 0, stops: [], live: null };
+function stopFeeds() { feeds.token++; feeds.stops.forEach(function (f) { try { f(); } catch (e) {} }); feeds.stops = []; feeds.live = null; }
+function clearBoard() { store.clear(); rows.forEach(function (r) { r.list = []; }); }
+function useFeed(feed) {                                          // run any feed that follows the data model (feed.stop is optional)
+  stopFeeds(); clearBoard(); var tok = feeds.token;
+  if (feed.stop) feeds.stops.push(function () { feed.stop(); });
+  feed.start(function (list) { if (tok === feeds.token) ingest(list); });
+}
+function activate() {                                             // start whatever CFG.source asks for; live falls back to the simulator
+  stopFeeds(); clearBoard();
+  var tok = feeds.token, simF = null, gotLive = false, lastKind = '';
+  function runSim() { if (simF) return false; simF = createSimFeed(); feeds.stops.push(function () { simF.stop(); }); simF.start(function (l) { if (tok === feeds.token && simF) ingest(l); }); return true; }
+  function dropSim() { if (!simF) return; simF.stop(); simF = null; clearBoard(); }
+  function say(kind, text, tagText, toastTxt) {
+    setStatus(kind, text, tagText);
+    if (kind !== lastKind && kind === 'warn' && toastTxt && renderer.xr.isPresenting) toast(toastTxt);
+    lastKind = kind;
+  }
+  if (CFG.source !== 'live') { runSim(); say('sim', 'Simulated data. Not real games or prices.', 'simulated data'); return; }
+  say('warn', 'Connecting to ESPN and Polymarket…', 'connecting…');
+  var live = createLiveFeed({
+    proxy: CFG.proxy,
+    wantProps: function () { return CFG.rows.props === true && showOdds(); },
+    onStatus: function (st) {
+      if (tok !== feeds.token) return;
+      if (st.phase === 'down') {
+        if (!gotLive) { runSim(); say('warn', 'ESPN unreachable (' + st.error + '). Showing SIMULATED data and retrying.', 'live unreachable · simulated', 'Live data unreachable'); }
+        return;
+      }
+      var t = new Date(st.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+      if (!st.games) say('live', 'Connected to ESPN, but no games on the slate right now · ' + t, 'live · no games');
+      else if (!st.odds && st.pmError) say('warn', st.games + ' games with live scores. Polymarket odds unavailable (' + st.pmError + ') · ' + t, 'scores only · no odds', 'Odds unavailable');
+      else if (!st.odds) say('warn', st.games + ' games with live scores. No Polymarket odds matched yet · ' + t, 'scores only · no odds', 'No odds matched');
+      else {
+        var pr = (CFG.rows.props === true && showOdds()) ? (st.props ? ' · props on ' + st.props : st.propsError ? ' · props unavailable (' + st.propsError + ')' : ' · no props found yet') : '';
+        say('live', 'Live · ' + st.games + ' games · odds on ' + st.odds + pr + ' · ESPN ' + st.espnOk + '/' + st.espnTotal + ' leagues · ' + t, 'live · espn + polymarket');
+      }
+    }
+  });
+  feeds.live = live; feeds.stops.push(function () { live.stop(); });
+  live.start(function (list) { if (tok !== feeds.token) return; if (simF) dropSim(); gotLive = true; ingest(list); });
+}
+window.OddsTicker = { CFG: CFG, ingest: ingest, useFeed: useFeed, activate: activate, createSimFeed: createSimFeed, createOddsApiFeed: createOddsApiFeed, createLiveFeed: createLiveFeed, store: store,
+  liveDebug: function () { return feeds.live ? feeds.live.debug() : null; },
+  _dbg: { feeds: feeds, setStatus: setStatus, UI: UI, rows: rows, vrBuild: vrBuild, vrRefresh: vrRefresh, vrPick: vrPick, act: act, pcv: pcv, openPanel: openPanel, closePanel: closePanel, pollXR: pollXR, LEAGUE_ORDER: LEAGUE_ORDER, isPanelOpen: function () { return panelOpen; }, isPaused: function () { return paused; } } };
+
+/* ---------- main loop ---------- */
+var last = performance.now();
+renderer.setAnimationLoop(function (now) {
+  var dt = Math.min(0.05, Math.max(0, (now - last) / 1000)); last = now;
+  if (renderer.xr.isPresenting) { pollXR(dt); if (++xrFrames === 20) recenter(); }
+  if (uiStale) { uiStale = false; domBuild(); }
+  if (!paused) theta += CFG.speed * dt * (CFG.reverse ? -1 : 1);
+  var g = geo(); rows.forEach(function (r) { layoutRow(r, g); });
+  if (budgetBoost > 0) budgetBoost--;
+  if (panelOpen && vrDirty) { vrRefresh(); vrDirty = false; }
+  if (toastSprite.visible && performance.now() > toastUntil) toastSprite.visible = false;
+  renderer.render(scene, camera);
+});
+
+/* ---------- boot ---------- */
+loadSettings();
+try {                                                              // ?source=sim|live and ?proxy=<url or template> (the proxy is remembered)
+  var qs = new URLSearchParams(location.search);
+  if (qs.get('source') === 'sim' || qs.get('source') === 'live') CFG.source = qs.get('source');
+  if (qs.has('proxy')) { CFG.proxy = qs.get('proxy') || ''; saveSettings(); }
+  if (qs.has('logos')) {                                           // ?logos=off, or ?logos=<folder holding NFL/, NBA/, NCAA/, Premier_League/>
+    var lq = qs.get('logos') || '';
+    if (lq === 'off') CFG.logos = false; else if (lq === 'on' || !lq) { CFG.logos = true; CFG.logoBase = ''; } else { CFG.logos = true; CFG.logoBase = /\/$/.test(lq) ? lq : lq + '/'; }
+    saveSettings();
+  }
+} catch (e) {}
+onResize(); applyView(); applyEnv(); domBuild(); applyGeometry();
+activate();
+if (document.fonts && document.fonts.load) {
+  Promise.race([
+    Promise.all([document.fonts.load('700 40px "Barlow Condensed"'), document.fonts.load('600 20px "Barlow Condensed"')]),
+    new Promise(function (r) { setTimeout(r, 3000); })
+  ]).then(function () { bump(); }, function () {});
+}
+setTimeout(function () { $('hint').style.opacity = 0; }, 7000);
+})();
+</script>
+</body>
+</html>
